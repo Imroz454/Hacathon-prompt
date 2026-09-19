@@ -1,0 +1,35 @@
+# Netlify Production Deployment Configuration for Lumina
+# Ensures zero 404s on refresh, immutable asset caching, and strict HTTPS security.
+
+[build]
+  publish = "dist"
+  command = "npm run build"
+
+# SPA Fallback Routing: Route all HTML navigation to index.html with HTTP 200
+[[redirects]]
+  from = "/api/*"
+  to = "/.netlify/functions/:splat"
+  status = 200
+
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200
+
+# Strict HTTPS, Mixed-Content Prevention, and Security Headers
+[[headers]]
+  for = "/*"
+  [headers.values]
+    X-Frame-Options = "SAMEORIGIN"
+    X-Content-Type-Options = "nosniff"
+    X-XSS-Protection = "1; mode=block"
+    Referrer-Policy = "strict-origin-when-cross-origin"
+    Strict-Transport-Security = "max-age=31536000; includeSubDomains; preload"
+    Permissions-Policy = "microphone=(self), camera=(), geolocation=()"
+    Content-Security-Policy = "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com data:; img-src 'self' data: https: blob:; connect-src 'self' https://generativelanguage.googleapis.com; media-src 'self' blob: data:; upgrade-insecure-requests;"
+
+# Long-term Immutable Caching for Bundled Static Assets
+[[headers]]
+  for = "/assets/*"
+  [headers.values]
+    Cache-Control = "public, max-age=31536000, immutable"

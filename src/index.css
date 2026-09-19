@@ -1,0 +1,128 @@
+@import "tailwindcss";
+
+@layer base {
+  :root {
+    --navy-deep: #0A192F;
+    --navy-primary: #0F172A;
+    --navy-slate: #1E293B;
+    --navy-muted: #334155;
+    --bg-canvas: #F4F7FB;
+    --bg-card: #FFFFFF;
+    --bg-card-subtle: #F8FAFC;
+    --border-subtle: #CBD5E1;
+    --border-strong: #94A3B8;
+    --gold-primary: #D97706;
+    --gold-deep: #B45309;
+    --gold-accent: #F59E0B;
+    --gold-soft: #FEF3C7;
+  }
+
+  html {
+    font-size: 18px; /* Default base size of at least 18px for senior readability */
+    transition: font-size 0.2s ease-in-out;
+  }
+
+  html[data-font-size="normal"] {
+    font-size: 18px;
+  }
+
+  html[data-font-size="large"] {
+    font-size: 22px;
+  }
+
+  html[data-font-size="huge"] {
+    font-size: 26px;
+  }
+
+  body {
+    background-color: var(--bg-canvas);
+    color: var(--navy-primary);
+    font-family: 'Inter', system-ui, -apple-system, sans-serif;
+    text-rendering: optimizeLegibility;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    line-height: 1.6;
+  }
+
+  /* High contrast focus ring for motor-impaired and elderly accessibility */
+  *:focus-visible {
+    outline: 3px solid #D97706 !important;
+    outline-offset: 3px !important;
+  }
+}
+
+/* Trust-focused elevations */
+.shadow-warm-xs, .shadow-lumina-xs {
+  box-shadow: 0 1px 3px rgba(15, 23, 42, 0.06), 0 1px 2px rgba(15, 23, 42, 0.04);
+}
+
+.shadow-warm-sm, .shadow-lumina-sm {
+  box-shadow: 0 2px 6px rgba(15, 23, 42, 0.07), 0 1px 3px rgba(15, 23, 42, 0.05);
+}
+
+.shadow-warm-md, .shadow-lumina-md {
+  box-shadow: 0 4px 14px rgba(15, 23, 42, 0.09), 0 2px 5px rgba(15, 23, 42, 0.05);
+}
+
+.shadow-warm-lg, .shadow-lumina-lg {
+  box-shadow: 0 8px 24px rgba(15, 23, 42, 0.11), 0 3px 8px rgba(15, 23, 42, 0.06);
+}
+
+/* Active navigation tab 3D elevation with warm gold & navy depth */
+.shadow-tab-active {
+  box-shadow: 0 8px 20px -2px rgba(15, 23, 42, 0.25), 0 3px 8px -1px rgba(217, 119, 6, 0.22);
+}
+
+/* Audio soundwave animations */
+@keyframes soundwave {
+  0%, 100% {
+    height: 6px;
+    opacity: 0.5;
+  }
+  50% {
+    height: 26px;
+    opacity: 1;
+  }
+}
+
+.animate-soundwave-1 {
+  animation: soundwave 0.9s ease-in-out infinite;
+  animation-delay: 0.1s;
+}
+
+.animate-soundwave-2 {
+  animation: soundwave 0.75s ease-in-out infinite;
+  animation-delay: 0.25s;
+}
+
+.animate-soundwave-3 {
+  animation: soundwave 1.1s ease-in-out infinite;
+  animation-delay: 0.4s;
+}
+
+.animate-soundwave-4 {
+  animation: soundwave 0.8s ease-in-out infinite;
+  animation-delay: 0.15s;
+}
+
+.animate-soundwave-5 {
+  animation: soundwave 1.0s ease-in-out infinite;
+  animation-delay: 0.3s;
+}
+
+.animate-soundwave-paused {
+  animation-play-state: paused !important;
+}
+
+@keyframes pulseGlow {
+  0%, 100% {
+    box-shadow: 0 0 0 0 rgba(217, 119, 6, 0.45);
+  }
+  50% {
+    box-shadow: 0 0 0 8px rgba(217, 119, 6, 0);
+  }
+}
+
+.animate-active-sentence {
+  animation: pulseGlow 2s infinite ease-in-out;
+}

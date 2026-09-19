@@ -1,0 +1,7 @@
+{
+  "name": "Lumina - Your Daily Companion",
+  "description": "Your trusted, private guide for daily clarity and peace of mind. An accessible, intelligent AI companion for seniors to simplify complex medical jargon, verify suspicious messages, and guide daily routines.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
+
