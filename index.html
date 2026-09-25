@@ -12,10 +12,99 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
+    <script>
+      (function() {
+        // Intercept and silence all Vite console notifications ([vite])
+        var filterVite = function(args) {
+          return args.some(function(arg) {
+            var str = typeof arg === 'string' ? arg : (arg && arg.message ? arg.message : '');
+            return str.includes('[vite]') || str.includes('WebSocket') || str.includes('vite-hmr');
+          });
+        };
+
+        var origError = console.error;
+        console.error = function() {
+          if (filterVite(Array.prototype.slice.call(arguments))) return;
+          origError.apply(console, arguments);
+        };
+
+        var origWarn = console.warn;
+        console.warn = function() {
+          if (filterVite(Array.prototype.slice.call(arguments))) return;
+          origWarn.apply(console, arguments);
+        };
+
+        var origLog = console.log;
+        console.log = function() {
+          if (filterVite(Array.prototype.slice.call(arguments))) return;
+          origLog.apply(console, arguments);
+        };
+
+        var origInfo = console.info;
+        console.info = function() {
+          if (filterVite(Array.prototype.slice.call(arguments))) return;
+          origInfo.apply(console, arguments);
+        };
+
+        // Global unhandled rejection and error suppression for WebSocket & Vite
+        window.addEventListener('unhandledrejection', function(event) {
+          var reason = event && event.reason ? String(event.reason) : '';
+          if (reason.includes('WebSocket') || reason.includes('[vite]') || reason.includes('vite')) {
+            event.preventDefault();
+            event.stopImmediatePropagation();
+          }
+        });
+
+        window.addEventListener('error', function(event) {
+          var msg = event && event.message ? String(event.message) : '';
+          if (msg.includes('WebSocket') || msg.includes('[vite]') || msg.includes('vite')) {
+            event.preventDefault();
+            event.stopImmediatePropagation();
+          }
+        });
+
+        // Intercept native WebSocket constructor for vite-hmr to prevent browser network error logs
+        if (typeof window.WebSocket !== 'undefined') {
+          var OrigWebSocket = window.WebSocket;
+          window.WebSocket = function(url, protocols) {
+            var urlStr = String(url || '');
+            var protoStr = String(protocols || '');
+            if (protoStr.includes('vite') || urlStr.includes('vite-hmr') || urlStr.includes(':3000') || urlStr.includes(':443')) {
+              var mockWs = {
+                readyState: 3, // CLOSED
+                url: urlStr,
+                protocol: protoStr,
+                send: function() {},
+                close: function() {},
+                addEventListener: function(event, cb) {
+                  if (event === 'close') {
+                    setTimeout(function() {
+                      try { cb({ wasClean: true, code: 1000, reason: 'Sandbox HMR Disabled' }); } catch(e) {}
+                    }, 50);
+                  }
+                },
+                removeEventListener: function() {},
+                dispatchEvent: function() { return false; },
+                onopen: null,
+                onclose: null,
+                onerror: null,
+                onmessage: null,
+              };
+              return mockWs;
+            }
+            return new OrigWebSocket(url, protocols);
+          };
+          window.WebSocket.prototype = OrigWebSocket.prototype;
+          window.WebSocket.CONNECTING = OrigWebSocket.CONNECTING;
+          window.WebSocket.OPEN = OrigWebSocket.OPEN;
+          window.WebSocket.CLOSING = OrigWebSocket.CLOSING;
+          window.WebSocket.CLOSED = OrigWebSocket.CLOSED;
+        }
+      })();
+    </script>
   </head>
   <body class="bg-[#F4F7FB] text-[#0F172A] antialiased selection:bg-amber-400 selection:text-slate-950 font-sans">
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>
-

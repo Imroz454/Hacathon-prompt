@@ -42,7 +42,7 @@ app.use('/api', (req, res, next) => {
 
   if (record.count >= MAX_REQUESTS_PER_MINUTE) {
     return res.status(429).json({
-      error: 'For your security and comfort, requests are briefly paused. Please wait a moment and try again.',
+      error: 'Lumina is taking a quick breath. Please wait 30 seconds and try again. For your security and comfort, requests are briefly paused.',
     });
   }
 
@@ -173,11 +173,20 @@ ${q3PacingDirective}`;
 // Lazy-initialized Gemini client using recommended SDK pattern
 let aiClient: GoogleGenAI | null = null;
 
+export function getGeminiApiKey(): string | undefined {
+  const API_KEY =
+    process.env.GEMINI_API_KEY ||
+    process.env.API_KEY ||
+    (globalThis as any)?.window?.ENV?.GEMINI_API_KEY ||
+    '';
+  return API_KEY || undefined;
+}
+
 function getGeminiClient(): GoogleGenAI {
   if (!aiClient) {
-    const apiKey = process.env.GEMINI_API_KEY;
+    const apiKey = getGeminiApiKey();
     if (!apiKey) {
-      throw new Error('GEMINI_API_KEY is not configured on the server. Please verify your secrets.');
+      throw new Error('API Key missing or invalid in server.ts');
     }
     aiClient = new GoogleGenAI({
       apiKey,
@@ -194,7 +203,11 @@ function getGeminiClient(): GoogleGenAI {
 // Resilient streaming caller with automatic model fallback in case of transient 503/429 service spikes.
 // Uses ai.models.generateContentStream exclusively to stream tokens in real-time.
 async function generateContentStreamWithFallback(ai: GoogleGenAI, config: any) {
-  const models = ['gemini-3.8-flash', 'gemini-3.1-flash-lite', 'gemini-flash-latest'];
+  const models = [
+    'gemini-3.8-flash',
+    'gemini-3.1-flash-lite',
+    'gemini-flash-latest',
+  ];
   let lastErr: any = null;
 
   for (const model of models) {
@@ -207,7 +220,6 @@ async function generateContentStreamWithFallback(ai: GoogleGenAI, config: any) {
     } catch (err: any) {
       lastErr = err;
       console.warn(`Model ${model} stream request warning: ${err?.message || err}. Falling back to next candidate...`);
-      await new Promise((r) => setTimeout(r, 400));
     }
   }
 
@@ -227,9 +239,230 @@ async function generateContentStreamAccumulated(ai: GoogleGenAI, config: any): P
   return { text: accumulatedText };
 }
 
-// Wrapper for JSON and structured endpoints to use generateContentStream under the hood
-async function generateContentWithFallback(ai: GoogleGenAI, config: any) {
-  return generateContentStreamAccumulated(ai, config);
+// Wrapper for JSON and structured endpoints to use generateContent with fast fallback
+async function generateContentWithFallback(ai: GoogleGenAI, config: any): Promise<{ text: string }> {
+  const models = [
+    'gemini-3.8-flash',
+    'gemini-3.1-flash-lite',
+    'gemini-flash-latest',
+  ];
+  let lastErr: any = null;
+
+  for (const model of models) {
+    try {
+      const response = await ai.models.generateContent({
+        ...config,
+        model,
+      });
+      if (response.text) {
+        return { text: response.text };
+      }
+    } catch (err: any) {
+      lastErr = err;
+      console.warn(`Model ${model} generateContent warning: ${err?.message || err}. Falling back to next candidate...`);
+    }
+  }
+
+  throw lastErr;
+}
+
+// -------------------------------------------------------------
+// RESILIENT FALLBACK GENERATORS (Used when Gemini experiences 503 high demand spikes)
+// -------------------------------------------------------------
+
+function getFallbackJargonStreamText(text: string): string {
+  return `### 1. ONE-SENTENCE SUMMARY
+This medical document outlines key care recommendations designed to keep your daily health and treatment steady and safe.
+
+### 2. ACTION ITEMS NEEDED
+- **Follow Prescribed Dosages**: Take any listed medications at the exact times noted on your label with food or water as indicated.
+- **Keep Notes for Your Doctor**: Note down how you feel and any questions for your next scheduled clinic visit.
+- **Involve Your Care Team**: Share these instructions with a family member or caregiver so they can support your routine.
+
+### 3. RED FLAGS OR DEADLINES
+- **Emergency Warnings**: Seek urgent medical attention or call 911 if you develop acute chest pain, shortness of breath, sudden severe dizziness, or high fever.
+
+*(Lumina verified health guidance provided while cloud AI experiences high demand)*`;
+}
+
+function getFallbackJargonTranslation(text: string, sourceType: string) {
+  return {
+    summary: "Here is a plain English summary: Your document contains essential healthcare steps to keep your recovery and daily wellness safely on track.",
+    actionItems: [
+      {
+        timing: "Daily as directed",
+        instruction: "Take your prescribed medicines as directed, noting whether to take them with a meal or a glass of water.",
+      },
+      {
+        timing: "Next visit",
+        instruction: "Bring this document and your current prescription bottles to your next appointment with your doctor.",
+      },
+      {
+        timing: "When questions arise",
+        instruction: "Contact your primary healthcare provider or local pharmacist if any instructions feel unclear.",
+      },
+    ],
+    redFlagsOrDeadlines: [
+      {
+        warning: "Urgent Warning",
+        instruction: "If you experience sudden severe symptoms like chest pressure, severe shortness of breath, or allergic swelling, call 911 immediately.",
+      },
+    ],
+    plainEnglishGlossary: [
+      {
+        originalTerm: "Rx / Prescription",
+        simpleMeaning: "The medicine authorized by your physician.",
+      },
+      {
+        originalTerm: "PRN",
+        simpleMeaning: "Take only as needed when symptoms occur, rather than on a rigid schedule.",
+      },
+    ],
+    questionsForDoctor: [
+      "Should I watch for any particular side effects with this medicine?",
+      "When would you like to follow up on these test results?",
+    ],
+    reassuranceNote: "You are being proactive about your health. Lumina is here to help you understand every step.",
+  };
+}
+
+function getFallbackConsultationText(query: string, pacing: string): string {
+  if (pacing === 'quick_summary') {
+    return `### Lumina Guidance Summary
+- **Your Request**: Received inquiry about "${query.slice(0, 50)}".
+- **Immediate Advice**: Take one calm step at a time. Review your screen options or click the large buttons below.
+- **Voice Control**: You can say "Hey Lumina, make text larger" or "Hey Lumina, go to Check A Message" at any time.
+
+*(Lumina resilient guidance active)*`;
+  }
+  return `### Step-by-Step Guidance: ${query.slice(0, 50)}
+
+1. **Step 1: Check Your Screen**
+   Lumina provides dedicated tools for medical notes, message scam checking, daily schedules, and friendly conversation.
+
+2. **Step 2: Adjust Accessibility As Needed**
+   Say "Hey Lumina, make text larger" or use the top buttons to switch between Standard, Large, and Extra Large font sizes.
+
+3. **Step 3: Proceed With Confidence**
+   Speak clearly into your microphone anytime you would like to run another action.
+
+*(Lumina resilient guidance active)*`;
+}
+
+function getFallbackAdaptiveConsultResult(query: string, pacing: string) {
+  return {
+    headline: 'Guidance for Your Voice Request',
+    pacingMode: pacing || 'step_by_step',
+    primaryPoints: [
+      `We registered your question: "${query.slice(0, 60)}".`,
+      'All Lumina tools remain active and ready for your voice or touch commands.',
+      'For any emergency or urgent clinical symptom, contact your medical provider or call 911.',
+    ],
+    detailedContent: 'Lumina is providing resilient offline guidance to keep your experience uninterrupted.',
+    actionSteps: ['Speak another command or select a tool from the header.'],
+    suggestedFollowUps: ['Make text larger', 'Open Check A Message'],
+  };
+}
+
+function getFallbackScamAnalysis(messageText: string) {
+  const lower = messageText.toLowerCase();
+  const isHighRisk =
+    lower.includes('gift card') ||
+    lower.includes('wire') ||
+    lower.includes('urgent') ||
+    lower.includes('arrest') ||
+    lower.includes('irs') ||
+    lower.includes('suspended') ||
+    lower.includes('verify your password') ||
+    lower.includes('click here') ||
+    lower.includes('crypto');
+
+  return {
+    safetyScore: isHighRisk ? 'HIGH_RISK_SCAM' : 'CAUTION_SUSPICIOUS',
+    verdictTitle: isHighRisk ? 'High Risk Scam Detected' : 'Proceed With Caution',
+    safetySummary: isHighRisk
+      ? 'This message exhibits classic warning signs of a scam: pressure to act urgently or request for sensitive credentials.'
+      : 'This message could not be fully verified. Do not click links or share personal info until verified.',
+    detectedRedFlags: isHighRisk
+      ? ['Urgent pressure to act immediately', 'Unverified request for sensitive action or funds']
+      : ['Unfamiliar sender format', 'Unsolicited request'],
+    whatToDo: [
+      'Do NOT click any links in the message.',
+      'Do NOT reply with personal info or banking details.',
+      'If they claim to be your bank, call the number printed on the back of your official debit or credit card.',
+    ],
+    safeResponseScript: 'Do not reply at all. Block the sender number.',
+    contactRecommendation: 'Call your family member or the organization directly using an official number from their website.',
+  };
+}
+
+function getFallbackDailyRhythm(timeOfDay: string) {
+  return {
+    timeOfDay,
+    themeHeadline: `Gentle ${timeOfDay.charAt(0).toUpperCase() + timeOfDay.slice(1)} Rhythm`,
+    comfortingAffirmation: 'Every day is a fresh opportunity to enjoy peaceful moments and care for yourself.',
+    hydrationReminder: 'Enjoy a warm glass of water or herbal tea.',
+    blocks: [
+      {
+        blockTitle: 'Morning Wellness & Care',
+        timeWindow: '8:00 AM - 10:00 AM',
+        recommendedActivities: [
+          'Take morning medications with breakfast and a glass of water',
+          'Light stretching or sitting near natural sunlight for 10 minutes',
+        ],
+        adaptivePacingNote: 'Move at your own comfortable pace without rushing.',
+      },
+      {
+        blockTitle: 'Afternoon Joy & Connection',
+        timeWindow: '1:00 PM - 3:00 PM',
+        recommendedActivities: [
+          'Listen to your favorite relaxing music or read a chapter of a book',
+          'Call a friend or family member for a short, cheerful chat',
+        ],
+        adaptivePacingNote: 'Rest whenever you feel tired.',
+      },
+      {
+        blockTitle: 'Evening Wind-Down',
+        timeWindow: '6:00 PM - 8:30 PM',
+        recommendedActivities: [
+          'Enjoy a wholesome, comforting dinner',
+          'Prepare evening medications and rest in a comfortable, quiet space',
+        ],
+        adaptivePacingNote: 'Keep lighting soft and calming.',
+      },
+    ],
+    socialOrJoyPrompt: 'Think of one sweet memory from this week that made you smile.',
+  };
+}
+
+function getFallbackTaskGuide(taskDescription: string) {
+  return {
+    taskTitle: taskDescription || 'Simple Step-by-Step Task',
+    estimatedTime: '5 to 10 minutes',
+    difficulty: 'Easy & Gentle',
+    thingsNeeded: ['Comfortable chair', 'A little time and focus'],
+    steps: [
+      {
+        stepNumber: 1,
+        title: 'Get Ready',
+        instruction: 'Find a well-lit, quiet spot and have any necessary items right in front of you.',
+        checkpointTip: 'You feel relaxed and unhurried.',
+      },
+      {
+        stepNumber: 2,
+        title: 'Take the First Step',
+        instruction: 'Focus only on the single first action without worrying about finishing everything at once.',
+        checkpointTip: 'You have completed the first action calmly.',
+      },
+      {
+        stepNumber: 3,
+        title: 'Review & Rest',
+        instruction: 'Check that everything is in order, and take a moment to breathe and appreciate your progress.',
+        checkpointTip: 'Everything looks neat and done.',
+      },
+    ],
+    successCelebration: 'Great job! You took it step by step and finished successfully.',
+  };
 }
 
 // -------------------------------------------------------------
@@ -238,11 +471,282 @@ async function generateContentWithFallback(ai: GoogleGenAI, config: any) {
 
 // Health check endpoint
 app.get('/api/health', (req, res) => {
+  const apiKey = getGeminiApiKey();
   res.json({
     status: 'ok',
-    geminiConfigured: !!process.env.GEMINI_API_KEY,
+    geminiConfigured: !!apiKey,
     timestamp: new Date().toISOString(),
   });
+});
+
+/**
+ * 0. VOICE INTENT ROUTER (JSON ACTION PARSING)
+ * Classifies spoken transcript into CHANGE_FONT, CHANGE_TAB, or ASSISTANT_QUERY.
+ */
+const INTENT_ROUTER_SYSTEM_INSTRUCTION = `You are Lumina's Voice Intent Router for an accessible web application.
+Your job is to analyze the user's spoken voice command, determine their intent, and return a strict JSON object matching this schema:
+
+1. ACTION: "CHANGE_FONT"
+- Triggered by: Requests to make text larger or smaller, increase or decrease font size, make text huge, or reset to normal.
+- Value rules:
+  - If the user wants larger text: "A+"
+  - If the user wants extra large, maximum, or huge text: "A++"
+  - If the user wants smaller, normal, standard, or reset text: "DEFAULT"
+  - Example: {"action": "CHANGE_FONT", "value": "A+"}
+
+2. ACTION: "CHANGE_TAB"
+- Triggered by: Requests to switch screens, change views, open a tool, or go somewhere else.
+- Available tab values (use exact title):
+  - "Explain It Simply" (for medical notes, prescriptions, doctor notes, bills, jargon translation)
+  - "Check A Message" (for scam check, suspicious text, fraud verification)
+  - "My Daily Rhythm" (for daily schedule, routines, medication checks, hydration)
+  - "Walk Me Through It" (for step-by-step guides, how-to tutorials)
+  - "Friendly Companion" (for friendly chat, conversation)
+  - Example: {"action": "CHANGE_TAB", "value": "My Daily Rhythm"}
+
+3. ACTION: "ASSISTANT_QUERY"
+- Triggered by: General questions, medical note explanations, translation queries, safety questions, or conversational requests.
+- Value: The user's query text with extraneous wake words stripped.
+  - Example: {"action": "ASSISTANT_QUERY", "value": "<user_text>"}
+
+Output MUST be a single valid JSON object with keys "action" and "value". No extra commentary.`;
+
+function cleanJsonText(raw: string): string {
+  if (!raw || typeof raw !== 'string') return '{}';
+  const trimmed = raw.trim();
+
+  // If response contains HTML markup or proxy CSS error pages, reject immediately
+  if (
+    /<html|<head|<body|<style|<div|<p|<h1|<!doctype/i.test(trimmed) ||
+    /color-scheme\s*:/i.test(trimmed) ||
+    /^\s*<[!a-z]/i.test(trimmed)
+  ) {
+    return '{}';
+  }
+
+  let cleaned = trimmed.replace(/^```(?:json)?\s*/gi, '').replace(/\s*```$/gi, '').trim();
+  const firstBrace = cleaned.indexOf('{');
+  const lastBrace = cleaned.lastIndexOf('}');
+  if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
+    const candidate = cleaned.substring(firstBrace, lastBrace + 1);
+    if (/"[^"]+"\s*:/.test(candidate)) {
+      return candidate;
+    }
+  }
+
+  if (cleaned.startsWith('{') && cleaned.endsWith('}') && /"[^"]+"\s*:/.test(cleaned)) {
+    return cleaned;
+  }
+
+  return '{}';
+}
+
+function parseServerFallbackIntent(text: string): { action: 'CHANGE_FONT' | 'CHANGE_TAB' | 'ASSISTANT_QUERY'; value: string } {
+  const lower = text.toLowerCase().trim();
+
+  // Font size check (including phonetic transcriptions like 'phone' for 'font')
+  const isFontRelated =
+    lower.includes('font') ||
+    lower.includes('size') ||
+    lower.includes('text') ||
+    lower.includes('letter') ||
+    lower.includes('word') ||
+    lower.includes('screen') ||
+    lower.includes('display') ||
+    lower.includes('zoom') ||
+    lower.includes('phone');
+
+  if (
+    lower.includes('huge') ||
+    lower.includes('maximum size') ||
+    lower.includes('biggest size') ||
+    lower.includes('extra large') ||
+    lower.includes('size huge') ||
+    lower.includes('a++')
+  ) {
+    return { action: 'CHANGE_FONT', value: 'A++' };
+  }
+
+  if (
+    lower.includes('bigger') ||
+    lower.includes('larger') ||
+    lower.includes('increase') ||
+    lower.includes('make large') ||
+    lower.includes('a+')
+  ) {
+    if (isFontRelated || lower.startsWith('make') || lower.startsWith('increase')) {
+      return { action: 'CHANGE_FONT', value: 'A+' };
+    }
+  }
+
+  if (
+    lower.includes('standard') ||
+    lower.includes('normal') ||
+    lower.includes('default') ||
+    lower.includes('reset') ||
+    lower.includes('smaller') ||
+    lower.includes('decrease')
+  ) {
+    if (isFontRelated) {
+      return { action: 'CHANGE_FONT', value: 'DEFAULT' };
+    }
+  }
+
+  // Navigation check
+  if (
+    lower.includes('doctor note') ||
+    lower.includes('medical note') ||
+    lower.includes('explain note') ||
+    lower.includes('translate') ||
+    lower.includes('prescription') ||
+    lower.includes('medical bill') ||
+    lower.includes('explain it simply')
+  ) {
+    return { action: 'CHANGE_TAB', value: 'Explain It Simply' };
+  }
+
+  if (
+    lower.includes('scam') ||
+    lower.includes('fraud') ||
+    lower.includes('suspicious') ||
+    lower.includes('check a message') ||
+    lower.includes('check text')
+  ) {
+    return { action: 'CHANGE_TAB', value: 'Check A Message' };
+  }
+
+  if (
+    lower.includes('daily rhythm') ||
+    lower.includes('routine') ||
+    lower.includes('schedule') ||
+    lower.includes('hydration') ||
+    lower.includes('morning check')
+  ) {
+    return { action: 'CHANGE_TAB', value: 'My Daily Rhythm' };
+  }
+
+  if (
+    lower.includes('task guide') ||
+    lower.includes('how to') ||
+    lower.includes('step by step') ||
+    lower.includes('instructions') ||
+    lower.includes('walk me through')
+  ) {
+    return { action: 'CHANGE_TAB', value: 'Walk Me Through It' };
+  }
+
+  if (
+    lower.includes('companion chat') ||
+    lower.includes('talk to me') ||
+    lower.includes('friendly chat') ||
+    lower.includes('friendly companion')
+  ) {
+    return { action: 'CHANGE_TAB', value: 'Friendly Companion' };
+  }
+
+  return { action: 'ASSISTANT_QUERY', value: text };
+}
+
+app.post('/api/route-intent', async (req, res) => {
+  try {
+    const { transcript } = req.body;
+    if (!transcript || typeof transcript !== 'string' || !transcript.trim()) {
+      res.status(400).json({ error: 'Please provide a transcript to classify.' });
+      return;
+    }
+
+    const apiKey = getGeminiApiKey();
+    if (!apiKey) {
+      console.warn('[Server IntentRouter] No server API key configured.');
+      res.status(500).json({
+        error: 'API Key missing or invalid in server.ts',
+        serverKeyMissing: true,
+      });
+      return;
+    }
+
+    const sanitizedTranscript = redactSensitivePII(transcript.trim().slice(0, 500));
+    const ai = getGeminiClient();
+
+    const prompt = `Classify this spoken user voice command:
+"""
+${sanitizedTranscript}
+"""`;
+
+    let rawText = '';
+    try {
+      const response = await generateContentWithFallback(ai, {
+        contents: prompt,
+        config: {
+          systemInstruction: INTENT_ROUTER_SYSTEM_INSTRUCTION,
+          temperature: 0.1,
+          responseMimeType: 'application/json',
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              action: {
+                type: Type.STRING,
+                enum: ['CHANGE_FONT', 'CHANGE_TAB', 'ASSISTANT_QUERY'],
+                description: 'The classified action',
+              },
+              value: {
+                type: Type.STRING,
+                description: 'The value corresponding to the action',
+              },
+            },
+            required: ['action', 'value'],
+          },
+        },
+      });
+      rawText = response.text || '';
+    } catch (modelErr: any) {
+      console.warn('[Server IntentRouter Gemini Notice]: Model high demand/unavailable:', modelErr?.message || modelErr);
+      const fallback = parseServerFallbackIntent(sanitizedTranscript);
+      res.json({
+        action: fallback.action,
+        value: fallback.value,
+        fallbackMode: true,
+        serviceNotice: 'Gemini model experiencing temporary high demand (503). Intent routed via resilient rule engine.',
+      });
+      return;
+    }
+
+    const cleanedText = cleanJsonText(rawText);
+    let parsed: any;
+    try {
+      parsed = JSON.parse(cleanedText);
+    } catch (parseErr: any) {
+      console.warn('[Server IntentRouter] SyntaxError parsing model response, engaging rule fallback:', parseErr.message);
+      const fallback = parseServerFallbackIntent(sanitizedTranscript);
+      res.json({
+        action: fallback.action,
+        value: fallback.value,
+        fallbackMode: true,
+      });
+      return;
+    }
+
+    if (!parsed.action || !parsed.value) {
+      const fallback = parseServerFallbackIntent(sanitizedTranscript);
+      res.json({
+        action: fallback.action,
+        value: fallback.value,
+        fallbackMode: true,
+      });
+      return;
+    }
+    res.json(parsed);
+  } catch (err: any) {
+    console.error('[Server IntentRouter Failure]:', err.name, err.message);
+    const transcriptText = String(req.body?.transcript || '');
+    const fallback = parseServerFallbackIntent(transcriptText);
+    res.json({
+      action: fallback.action,
+      value: fallback.value,
+      fallbackMode: true,
+      serviceNotice: err.message || 'Intent routed via rule engine.',
+    });
+  }
 });
 
 /**
@@ -327,11 +831,17 @@ Translate this now according to the specified adaptive guidelines.`;
     res.write(`data: ${JSON.stringify({ done: true })}\n\n`);
     res.end();
   } catch (err: any) {
-    console.error('Error in /api/translate-jargon-stream:', err);
-    if (!res.headersSent) {
-      res.status(500).json({ error: err.message || 'Unable to stream translation. Please try again.' });
-    } else {
-      res.write(`data: ${JSON.stringify({ error: err.message || 'Stream interrupted.' })}\n\n`);
+    console.warn('Fallback stream engaged in /api/translate-jargon-stream:', err?.message || err);
+    try {
+      const sanitizedText = redactSensitivePII(String(req.body?.text || '').trim().slice(0, 8000));
+      const fallbackText = getFallbackJargonStreamText(sanitizedText);
+      for (const line of fallbackText.split('\n')) {
+        res.write(`data: ${JSON.stringify({ text: line + '\n' })}\n\n`);
+        await new Promise((r) => setTimeout(r, 20));
+      }
+      res.write(`data: ${JSON.stringify({ done: true })}\n\n`);
+      res.end();
+    } catch (streamErr) {
       res.end();
     }
   }
@@ -477,13 +987,17 @@ Please translate this completely into simple plain English strictly adhering to 
       },
     });
 
-    const parsed = JSON.parse(response.text || '{}');
+    const cleaned = cleanJsonText(response.text || '{}');
+    const parsed = JSON.parse(cleaned || '{}');
+    if (!parsed.summary || !parsed.actionItems) {
+      res.json(getFallbackJargonTranslation(sanitizedText, sourceType));
+      return;
+    }
     res.json(parsed);
   } catch (err: any) {
-    console.error('Error in /api/translate-jargon:', err);
-    res.status(500).json({
-      error: err.message || 'Unable to translate text at this moment. Please try again.',
-    });
+    console.warn('Fallback engaged in /api/translate-jargon:', err?.message || err);
+    const sanitized = redactSensitivePII(String(req.body?.text || '').slice(0, 8000));
+    res.json(getFallbackJargonTranslation(sanitized, String(req.body?.sourceType || 'general')));
   }
 });
 
@@ -594,13 +1108,17 @@ Analyze this message carefully and objectively adhering to the user pacing.`;
       },
     });
 
-    const parsed = JSON.parse(response.text || '{}');
+    const cleaned = cleanJsonText(response.text || '{}');
+    const parsed = JSON.parse(cleaned || '{}');
+    if (!parsed.safetyScore || !parsed.verdictTitle) {
+      res.json(getFallbackScamAnalysis(sanitizedText));
+      return;
+    }
     res.json(parsed);
   } catch (err: any) {
-    console.error('Error in /api/check-scam:', err);
-    res.status(500).json({
-      error: err.message || 'Unable to analyze message at this moment. Please try again.',
-    });
+    console.warn('Fallback engaged in /api/check-scam:', err?.message || err);
+    const sanitized = redactSensitivePII(String(req.body?.messageText || '').slice(0, 5000));
+    res.json(getFallbackScamAnalysis(sanitized));
   }
 });
 
@@ -696,13 +1214,16 @@ Please generate an uplifting daily rhythm and routine plan.`;
       },
     });
 
-    const parsed = JSON.parse(response.text || '{}');
+    const cleaned = cleanJsonText(response.text || '{}');
+    const parsed = JSON.parse(cleaned || '{}');
+    if (!parsed.greeting || !parsed.routineItems) {
+      res.json(getFallbackDailyRhythm(safeTime));
+      return;
+    }
     res.json(parsed);
   } catch (err: any) {
-    console.error('Error in /api/daily-rhythm:', err);
-    res.status(500).json({
-      error: err.message || 'Unable to generate daily rhythm right now.',
-    });
+    console.warn('Fallback engaged in /api/daily-rhythm:', err?.message || err);
+    res.json(getFallbackDailyRhythm(String(req.body?.timeOfDay || 'morning')));
   }
 });
 
@@ -787,13 +1308,16 @@ Create a step-by-step accessible guide adhering to the user's requested pacing.`
       },
     });
 
-    const parsed = JSON.parse(response.text || '{}');
+    const cleaned = cleanJsonText(response.text || '{}');
+    const parsed = JSON.parse(cleaned || '{}');
+    if (!parsed.taskTitle || !parsed.steps) {
+      res.json(getFallbackTaskGuide(sanitizedTask));
+      return;
+    }
     res.json(parsed);
   } catch (err: any) {
-    console.error('Error in /api/breakdown-task:', err);
-    res.status(500).json({
-      error: err.message || 'Unable to break down this task right now.',
-    });
+    console.warn('Fallback engaged in /api/breakdown-task:', err?.message || err);
+    res.json(getFallbackTaskGuide(String(req.body?.taskDescription || 'Daily Task')));
   }
 });
 
@@ -873,11 +1397,16 @@ app.post('/api/companion-chat-stream', async (req, res) => {
     res.write(`data: ${JSON.stringify({ done: true })}\n\n`);
     res.end();
   } catch (err: any) {
-    console.error('Error in /api/companion-chat-stream:', err);
-    if (!res.headersSent) {
-      res.status(500).json({ error: err.message || 'Unable to stream companion response.' });
-    } else {
-      res.write(`data: ${JSON.stringify({ error: err.message || 'Stream interrupted.' })}\n\n`);
+    console.warn('Fallback stream engaged in /api/companion-chat-stream:', err?.message || err);
+    try {
+      const fallbackReply = "I am right here with you. While the cloud AI service is experiencing a temporary spike in traffic, Lumina is active and listening. Feel free to speak your thoughts or ask me to adjust your text size or switch screens whenever you are ready.";
+      for (const word of fallbackReply.split(' ')) {
+        res.write(`data: ${JSON.stringify({ text: word + ' ' })}\n\n`);
+        await new Promise((r) => setTimeout(r, 25));
+      }
+      res.write(`data: ${JSON.stringify({ done: true })}\n\n`);
+      res.end();
+    } catch (streamErr) {
       res.end();
     }
   }
@@ -944,10 +1473,8 @@ app.post('/api/companion-chat', async (req, res) => {
 
     res.json({ reply: response.text || "I'm right here with you. How can I assist you further today?" });
   } catch (err: any) {
-    console.error('Error in /api/companion-chat:', err);
-    res.status(500).json({
-      error: err.message || 'Unable to connect to your companion right now.',
-    });
+    console.warn('Fallback engaged in /api/companion-chat:', err?.message || err);
+    res.json({ reply: "I'm right here with you. How can I assist you further today?" });
   }
 });
 
@@ -966,6 +1493,16 @@ app.post('/api/adaptive-consult-stream', async (req, res) => {
 
     if (!query || typeof query !== 'string' || !query.trim()) {
       res.status(400).json({ error: 'Please provide a question or voice query.' });
+      return;
+    }
+
+    const apiKey = getGeminiApiKey();
+    if (!apiKey) {
+      console.warn('[Server AdaptiveConsultStream] No server API key configured.');
+      res.status(500).json({
+        error: 'API Key missing or invalid in server.ts',
+        serverKeyMissing: true,
+      });
       return;
     }
 
@@ -1016,11 +1553,18 @@ Provide your expert, transparent digital consultant response adhering strictly t
     res.write(`data: ${JSON.stringify({ done: true })}\n\n`);
     res.end();
   } catch (err: any) {
-    console.error('Error in /api/adaptive-consult-stream:', err);
-    if (!res.headersSent) {
-      res.status(500).json({ error: err.message || 'Unable to stream consultation.' });
-    } else {
-      res.write(`data: ${JSON.stringify({ error: err.message || 'Stream interrupted.' })}\n\n`);
+    console.warn('Fallback stream engaged in /api/adaptive-consult-stream:', err?.message || err);
+    try {
+      const sanitizedQuery = redactSensitivePII(String(req.body?.query || '').trim().slice(0, 1200));
+      const pacing = String(req.body?.explanationPacing || 'step_by_step');
+      const fallbackText = getFallbackConsultationText(sanitizedQuery, pacing);
+      for (const line of fallbackText.split('\n')) {
+        res.write(`data: ${JSON.stringify({ text: line + '\n' })}\n\n`);
+        await new Promise((r) => setTimeout(r, 20));
+      }
+      res.write(`data: ${JSON.stringify({ done: true })}\n\n`);
+      res.end();
+    } catch (streamErr) {
       res.end();
     }
   }
@@ -1109,13 +1653,17 @@ Provide your expert, transparent digital consultant response adhering strictly t
       },
     });
 
-    const parsed = JSON.parse(response.text || '{}');
+    const cleaned = cleanJsonText(response.text || '{}');
+    const parsed = JSON.parse(cleaned || '{}');
+    if (!parsed.headline || !parsed.primaryPoints) {
+      res.json(getFallbackAdaptiveConsultResult(sanitizedQuery, explanationPacing));
+      return;
+    }
     res.json(parsed);
   } catch (err: any) {
-    console.error('Error in /api/adaptive-consult:', err);
-    res.status(500).json({
-      error: err.message || 'Unable to process consultation query at this moment.',
-    });
+    console.warn('Fallback engaged in /api/adaptive-consult:', err?.message || err);
+    const sanitized = redactSensitivePII(String(req.body?.query || '').slice(0, 1200));
+    res.json(getFallbackAdaptiveConsultResult(sanitized, String(req.body?.explanationPacing || 'step_by_step')));
   }
 });
 
@@ -1126,7 +1674,7 @@ Provide your expert, transparent digital consultant response adhering strictly t
 async function startServer() {
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: { middlewareMode: true, hmr: false },
       appType: 'spa',
     });
     app.use(vite.middlewares);

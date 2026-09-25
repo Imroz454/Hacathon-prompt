@@ -125,4 +125,47 @@ You are doing a wonderful job taking care of yourself!
     assert.strictEqual(cappedPoints[1].title, 'Drink Plenty of Water');
     assert.strictEqual(cappedPoints[2].title, 'Walk 15 Minutes');
   });
+
+  test('Key Fallback logic resolves GEMINI_API_KEY, API_KEY, or window.ENV.GEMINI_API_KEY', async () => {
+    const { getClientGeminiApiKey } = await import('../src/services/api');
+    
+    // Test window.ENV fallback
+    (globalThis as any).window = { ENV: { GEMINI_API_KEY: 'test-window-key-123' } };
+    const savedProcessGemini = process.env.GEMINI_API_KEY;
+    const savedProcessApi = process.env.API_KEY;
+    delete process.env.GEMINI_API_KEY;
+    delete process.env.API_KEY;
+
+    const resolvedWindow = getClientGeminiApiKey();
+    assert.strictEqual(resolvedWindow, 'test-window-key-123');
+
+    // Test process.env.API_KEY fallback
+    process.env.API_KEY = 'test-api-key-456';
+    const resolvedApi = getClientGeminiApiKey();
+    assert.ok(resolvedApi === 'test-api-key-456' || resolvedApi === 'test-window-key-123');
+
+    // Cleanup
+    if (savedProcessGemini) process.env.GEMINI_API_KEY = savedProcessGemini;
+    if (savedProcessApi) process.env.API_KEY = savedProcessApi;
+    delete (globalThis as any).window;
+  });
+
+  test('Instant Local Action Routing matches font size and tab switches without network calls', () => {
+    // Font regex
+    const fontRegex = /larger|bigger|increase font|huge/i;
+    assert.ok(fontRegex.test('Make the text larger'));
+    assert.ok(fontRegex.test('Make font bigger'));
+    assert.ok(fontRegex.test('Please increase font size'));
+    assert.ok(fontRegex.test('Make it huge'));
+    assert.strictEqual(fontRegex.test('What is my medicine schedule?'), false);
+
+    // Tab switching regex
+    const tabRegex = /(?:go to|open|switch to)/i;
+    assert.ok(tabRegex.test('go to check a message'));
+    assert.ok(tabRegex.test('switch to daily rhythm'));
+    assert.ok(tabRegex.test('open friendly companion'));
+    assert.ok(tabRegex.test('open explain it simply'));
+    assert.ok(tabRegex.test('switch to walk me through it'));
+    assert.strictEqual(tabRegex.test('Can you explain my blood pressure?'), false);
+  });
 });

@@ -19,8 +19,10 @@ import { FontSize, ThemeMode, AdaptivePreferences } from './types/companion';
 import { Header } from './components/Header';
 import { CalmVoiceConsole } from './components/CalmVoiceConsole';
 import { VoiceAssistant } from './components/VoiceAssistant';
+import { GlobalErrorBoundary } from './components/GlobalErrorBoundary';
 import { AdaptiveStateManager } from './utils/adaptiveState';
 import { SoundEffects } from './utils/speech';
+import { adaptiveConsultStream } from './services/api';
 
 // Performance Optimization: Lazy-load view components for code-splitting
 const JargonTranslatorView = lazy(() =>
@@ -213,13 +215,14 @@ export default function App() {
   ] as const;
 
   return (
-    <div
-      className={`min-h-screen transition-colors font-sans ${fontScaleClass} ${
-        isHighContrast
-          ? 'bg-[#060D17] text-white'
-          : 'bg-[#F4F7FB] text-[#0F172A]'
-      }`}
-    >
+    <GlobalErrorBoundary>
+      <div
+        className={`min-h-screen transition-colors font-sans ${fontScaleClass} ${
+          isHighContrast
+            ? 'bg-[#060D17] text-white'
+            : 'bg-[#F4F7FB] text-[#0F172A]'
+        }`}
+      >
       {/* Accessible Header */}
       <Header
         fontSize={fontSize}
@@ -583,7 +586,9 @@ export default function App() {
         activeTab={activeTab}
         onNavigateTab={(tab) => setActiveTab(tab)}
         onChangeFontSize={(size) => setFontSize(size)}
+        geminiStreamingFn={adaptiveConsultStream}
       />
-    </div>
+      </div>
+    </GlobalErrorBoundary>
   );
 }

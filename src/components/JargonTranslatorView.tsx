@@ -25,6 +25,12 @@ import { translateJargon, translateJargonStream } from '../services/api';
 import { parseJargonMarkdown, ParsedJargonResult } from '../utils/jargonParser';
 import { TextToSpeech, SoundEffects } from '../utils/speech';
 import { VoiceInputButton } from './VoiceInputButton';
+import {
+  useQuotaCooldown,
+  QuotaManager,
+  isQuotaOrRateLimitError,
+  QUOTA_PAUSED_NOTICE,
+} from '../utils/quotaManager';
 
 interface JargonTranslatorViewProps {
   themeMode: ThemeMode;

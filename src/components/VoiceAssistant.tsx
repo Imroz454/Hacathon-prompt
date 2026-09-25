@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useCallback, Component, ErrorInfo, ReactNode } from 'react';
 import {
   Mic,
   MicOff,
@@ -13,49 +13,80 @@ import {
   Radio,
   Square,
   Compass,
+  Activity,
+  RotateCcw,
+  CheckCircle2,
+  Zap,
 } from 'lucide-react';
 import { ThemeMode } from '../types/companion';
-import { SoundEffects } from '../utils/speech';
-import { adaptiveConsult } from '../services/api';
+import {
+  adaptiveConsultStream,
+  routeVoiceIntent,
+  VoiceIntentResult,
+  getClientGeminiApiKey,
+  checkServerGeminiStatus,
+} from '../services/api';
 
 /**
  * Configurable Wake Word Constant.
- * Easily change the assistant's name or wake phrase here.
  */
 export const DEFAULT_WAKE_WORD = 'Hey Lumina';
 
-interface VoiceAssistantProps {
-  /**
-   * Configurable wake word. Defaults to 'Hey Lumina'.
-   */
+/**
+ * Exact Gemini System Instructions for the JSON Intent Router.
+ * Exported so engineers and runtime callers can verify or inspect the prompt.
+ */
+export const INTENT_ROUTER_SYSTEM_INSTRUCTION = `You are Lumina's Voice Intent Router for an accessible web application.
+Your job is to analyze the user's spoken voice command, determine their intent, and return a strict JSON object matching this schema:
+
+1. ACTION: "CHANGE_FONT"
+- Triggered by: Requests to make text larger or smaller, increase or decrease font size, make text huge, or reset to normal.
+- Value rules:
+  - If the user wants larger text: "A+"
+  - If the user wants extra large, maximum, or huge text: "A++"
+  - If the user wants smaller, normal, standard, or reset text: "DEFAULT"
+  - Example: {"action": "CHANGE_FONT", "value": "A+"}
+
+2. ACTION: "CHANGE_TAB"
+- Triggered by: Requests to switch screens, change views, open a tool, or go somewhere else.
+- Available tab values (use exact title):
+  - "Explain It Simply" (for medical notes, prescriptions, doctor notes, bills, jargon translation)
+  - "Check A Message" (for scam check, suspicious text, fraud verification)
+  - "My Daily Rhythm" (for daily schedule, routines, medication checks, hydration)
+  - "Walk Me Through It" (for step-by-step guides, how-to tutorials)
+  - "Friendly Companion" (for friendly chat, conversation)
+  - Example: {"action": "CHANGE_TAB", "value": "My Daily Rhythm"}
+
+3. ACTION: "ASSISTANT_QUERY"
+- Triggered by: General questions, medical note explanations, translation queries, safety questions, or conversational requests.
+- Value: The user's query text with extraneous wake words stripped.
+  - Example: {"action": "ASSISTANT_QUERY", "value": "<user_text>"}
+
+Output MUST be a single valid JSON object with keys "action" and "value". No extra commentary.`;
+
+/**
+ * Type signature for the main Gemini API streaming function.
+ */
+export type GeminiStreamingFn = (
+  input: any,
+  onChunk: (accumulated: string, latestChunk: string) => void,
+  onDone: (fullText: string) => void,
+  onError: (error: Error) => void
+) => Promise<(() => void) | void> | (() => void) | void;
+
+export interface VoiceAssistantProps {
   wakeWord?: string;
-  /**
-   * Theme mode for accessible high-contrast rendering.
-   */
   themeMode?: ThemeMode;
-  /**
-   * Current active tab in the app so the assistant knows what the user is seeing.
-   */
-  activeTab?: 'jargon' | 'scam' | 'rhythm' | 'task' | 'companion';
-  /**
-   * Function to navigate between application tabs via voice.
-   */
+  activeTab?: 'jargon' | 'scam' | 'rhythm' | 'task' | 'companion' | string;
   onNavigateTab?: (tab: 'jargon' | 'scam' | 'rhythm' | 'task' | 'companion') => void;
-  /**
-   * Function to change text size via voice.
-   */
   onChangeFontSize?: (size: 'normal' | 'large' | 'huge') => void;
-  /**
-   * Optional callback when a valid voice command is triggered.
-   */
   onCommandTriggered?: (command: string) => void;
-  /**
-   * Optional callback when Gemini returns a response.
-   */
   onResponseReceived?: (command: string, response: string) => void;
   /**
-   * Optional CSS class overrides.
+   * Main Gemini API streaming function passed into the VoiceAssistant component as a prop.
+   * Defaults to adaptiveConsultStream if not explicitly provided.
    */
+  geminiStreamingFn?: GeminiStreamingFn;
   className?: string;
 }
 
@@ -68,7 +99,112 @@ export type AssistantState =
   | 'speaking'
   | 'error';
 
-export function VoiceAssistant({
+/**
+ * Normalizes speech input by stripping punctuation, trimming extra whitespace, and converting to lowercase.
+ */
+function normalizeSpeech(text: string): string {
+  return text
+    .toLowerCase()
+    .replace(/[.,\/#!$%\^&\*;:{}=\-_`~()?"'–—]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/**
+ * Regex for fuzzy phonetic wake-word matching.
+ * Matches: (hey|hi|hello|ok|okay) (lumina|luminous|lumena|illumina|mina|loumina|aluminer)
+ */
+export const WAKE_WORD_REGEX = /(?:(hey|hi|hello|ok|okay)\s+)?(lumina|luminous|lumena|illumina|mina|loumina|aluminer)\b/i;
+
+interface ExtractedMatch {
+  matched: boolean;
+  wakeWord: string;
+  command: string;
+}
+
+/**
+ * Inspects transcript for wake-word trigger and splits the transcript string
+ * to extract everything after the wake word.
+ */
+function extractVoiceCommand(transcript: string, customWakeWord?: string): ExtractedMatch {
+  const normalized = normalizeSpeech(transcript);
+
+  // 1. Check custom wake word if provided
+  if (customWakeWord) {
+    const normCustom = normalizeSpeech(customWakeWord);
+    const customIdx = normalized.indexOf(normCustom);
+    if (customIdx !== -1) {
+      const parts = normalized.split(normCustom);
+      const trailing = parts.slice(1).join(normCustom).replace(/^[\s,.:;!?-]+/, '').trim();
+      return {
+        matched: true,
+        wakeWord: normCustom,
+        command: trailing,
+      };
+    }
+  }
+
+  // 2. Fuzzy phonetic regex match
+  const match = normalized.match(WAKE_WORD_REGEX);
+  if (match && typeof match.index === 'number') {
+    const matchedPhrase = match[0];
+    const parts = normalized.split(new RegExp(matchedPhrase.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i'));
+    const trailing = parts.slice(1).join(matchedPhrase).replace(/^[\s,.:;!?-]+/, '').trim();
+    return {
+      matched: true,
+      wakeWord: matchedPhrase,
+      command: trailing,
+    };
+  }
+
+  return {
+    matched: false,
+    wakeWord: '',
+    command: '',
+  };
+}
+
+/**
+ * Plays an instant Web Audio API beep chime (440Hz oscillator for 120ms).
+ */
+function playWakeChime(audioCtxRef: React.MutableRefObject<AudioContext | null>) {
+  try {
+    const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
+    if (!AudioCtx) return;
+
+    if (!audioCtxRef.current || audioCtxRef.current.state === 'closed') {
+      audioCtxRef.current = new AudioCtx();
+    }
+    const ctx = audioCtxRef.current;
+    if (ctx.state === 'suspended') {
+      ctx.resume().catch(() => {});
+    }
+
+    const now = ctx.currentTime;
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(440, now); // 440Hz A4 tone
+
+    // Smooth envelope over 120ms to avoid audio clicks
+    gain.gain.setValueAtTime(0.18, now);
+    gain.gain.exponentialRampToValueAtTime(0.001, now + 0.12);
+
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+
+    osc.start(now);
+    osc.stop(now + 0.12);
+  } catch (err) {
+    console.warn('VoiceAssistant Web Audio chime error:', err);
+  }
+}
+
+/**
+ * Voice Assistant Component Inner Implementation
+ */
+function VoiceAssistantInner({
   wakeWord = DEFAULT_WAKE_WORD,
   themeMode = 'warm',
   activeTab = 'jargon',
@@ -76,50 +212,103 @@ export function VoiceAssistant({
   onChangeFontSize,
   onCommandTriggered,
   onResponseReceived,
+  geminiStreamingFn,
   className = '',
 }: VoiceAssistantProps) {
   const isHighContrast = themeMode === 'high-contrast';
 
-  // Hands-Free Assistant Toggle State
+  // Component UI State
   const [isEnabled, setIsEnabled] = useState<boolean>(false);
   const [status, setStatus] = useState<AssistantState>('disabled');
+  const [connectionStatus, setConnectionStatus] = useState<string>('Standby (Click Start Listening)');
   const [isExpanded, setIsExpanded] = useState<boolean>(false);
 
-  // Transcript & Content States
+  // Manual Wake-Word Bypass:
+  // If the user physically clicks "Start Listening", temporarily disable the 'Hey Lumina' regex
+  // requirement for the very next spoken phrase. Treat their immediate input as a direct command.
+  const manualBypassRef = useRef<boolean>(false);
+  const [isManualBypassActive, setIsManualBypassActive] = useState<boolean>(false);
+
+  // Transcript and Streaming States
   const [liveTranscript, setLiveTranscript] = useState<string>('');
   const [extractedCommand, setExtractedCommand] = useState<string>('');
   const [assistantResponse, setAssistantResponse] = useState<string>('');
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [apiKeyAlert, setApiKeyAlert] = useState<string | null>(null);
+  const [redToast, setRedToast] = useState<string | null>(null);
+  const redToastTimerRef = useRef<any>(null);
 
-  // References to manage speech lifecycle, silence timeouts, and deduplication
+  const showRedToast = useCallback((msg = 'API Key missing or invalid in server.ts') => {
+    setRedToast(msg);
+    if (redToastTimerRef.current) clearTimeout(redToastTimerRef.current);
+    redToastTimerRef.current = setTimeout(() => {
+      setRedToast(null);
+    }, 6000);
+  }, []);
+
+  // 1. API SDK / Key Verification on mount:
+  // Checks environment and server configuration; triggers immediate UI alert if undefined
+  useEffect(() => {
+    const clientKey = getClientGeminiApiKey();
+    checkServerGeminiStatus().then((serverStatus) => {
+      if (!serverStatus.configured && !clientKey) {
+        const warning = 'API Key missing or invalid in server.ts';
+        showRedToast(warning);
+        setErrorMessage(warning);
+        console.error('[VoiceAssistant API Connection Error]:', warning);
+      }
+    });
+  }, [showRedToast]);
+
+  // References to manage speech lifecycle and echo cancellation
   const recognitionRef = useRef<any>(null);
+  const audioCtxRef = useRef<AudioContext | null>(null);
   const isEnabledRef = useRef<boolean>(isEnabled);
-  const statusRef = useRef<AssistantState>(status);
   const isSpeakingRef = useRef<boolean>(false);
   const isProcessingRef = useRef<boolean>(false);
 
-  // Active command buffer and debounce timer
-  const accumulatedCommandRef = useRef<string>('');
-  const wakeWordTriggeredRef = useRef<boolean>(false);
-  const silenceTimerRef = useRef<any>(null);
+  // Auto-restart & exponential backoff tracking
   const restartTimerRef = useRef<any>(null);
-  const waitTimeoutRef = useRef<any>(null);
+  const backoffCountRef = useRef<number>(0);
+  const lastStartTimeRef = useRef<number>(0);
 
-  // Deduplication tracking
+  // Trailing speech accumulation & silence timeouts
+  const wakeWordTriggeredRef = useRef<boolean>(false);
+  const accumulatedCommandRef = useRef<string>('');
+  const silenceTimerRef = useRef<any>(null);
+  const abortStreamRef = useRef<(() => void) | null>(null);
+
+  // Deduplication
   const lastProcessedCommandRef = useRef<string>('');
   const lastProcessedTimeRef = useRef<number>(0);
 
-  // Sync refs with state
+  // Safe ref for safeStartRecognition to prevent hoisting / temporal dead-zone errors
+  const safeStartRecognitionRef = useRef<() => void>(() => {});
+
+  // Keep refs in sync with state
   useEffect(() => {
     isEnabledRef.current = isEnabled;
   }, [isEnabled]);
 
-  useEffect(() => {
-    statusRef.current = status;
-  }, [status]);
+  /**
+   * Safely stops browser speech recognition without triggering unintended error states
+   */
+  const safeStopRecognition = useCallback(() => {
+    if (restartTimerRef.current) {
+      clearTimeout(restartTimerRef.current);
+      restartTimerRef.current = null;
+    }
+    if (recognitionRef.current) {
+      try {
+        recognitionRef.current.abort();
+      } catch (e) {
+        // Safe ignore
+      }
+    }
+  }, []);
 
   /**
-   * Cleanly stop all active speech synthesis (TTS)
+   * Halts active speech synthesis (TTS) and returns to idle listening if enabled
    */
   const stopSpeaking = useCallback(() => {
     if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
@@ -127,27 +316,17 @@ export function VoiceAssistant({
     }
     isSpeakingRef.current = false;
     isProcessingRef.current = false;
-    if (statusRef.current === 'speaking' || statusRef.current === 'processing') {
+    if (isEnabledRef.current) {
       setStatus('idle_listening');
+      setConnectionStatus("Active - Listening for 'Hey Lumina'");
+    } else {
+      setStatus('disabled');
+      setConnectionStatus('Standby (Click Start Listening)');
     }
   }, []);
 
   /**
-   * Helper to safely stop recognition without triggering accidental restart
-   */
-  const safeStopRecognition = useCallback(() => {
-    if (recognitionRef.current) {
-      try {
-        recognitionRef.current.abort();
-      } catch (e) {
-        // ignore
-      }
-    }
-  }, []);
-
-  /**
-   * Synthesizes text aloud using window.speechSynthesis with calm senior-friendly pacing.
-   * Pitch = 1.0, Rate = 0.85
+   * Calm senior-friendly text-to-speech with acoustic echo prevention
    */
   const speakAloud = useCallback(
     (text: string, onDone?: () => void) => {
@@ -156,25 +335,25 @@ export function VoiceAssistant({
         return;
       }
 
-      // 1. Immediately halt speech recognition so the microphone NEVER listens to its own voice
+      // Echo cancellation: abort speech recognition before speaking
       safeStopRecognition();
       window.speechSynthesis.cancel();
 
       isSpeakingRef.current = true;
       setStatus('speaking');
+      setConnectionStatus('Speaking Response...');
 
-      // Strip markdown symbols and excessive punctuation for natural acoustic readout
       const cleanText = text
         .replace(/[*#_`~[\]]/g, '')
         .replace(/\n+/g, '. ')
         .trim();
 
       const utterance = new SpeechSynthesisUtterance(cleanText);
-      utterance.rate = 0.85; // Calm, steady pacing for seniors
-      utterance.pitch = 1.0; // Natural, clear pitch
+      utterance.rate = 0.85; // Calm, steady pacing
+      utterance.pitch = 1.0;
       utterance.lang = 'en-US';
 
-      // Pick a natural English voice if available
+      // Select gentle natural English voice
       const voices = window.speechSynthesis.getVoices();
       const preferredVoice = voices.find(
         (v) =>
@@ -189,6 +368,7 @@ export function VoiceAssistant({
         utterance.voice = preferredVoice;
       }
 
+      // Resumes listening strictly AFTER utterance.onend fires
       utterance.onend = () => {
         isSpeakingRef.current = false;
         isProcessingRef.current = false;
@@ -197,18 +377,22 @@ export function VoiceAssistant({
 
         if (isEnabledRef.current) {
           setStatus('idle_listening');
-          // Wait 400ms cooldown after speech ends before unmuting mic
+          setConnectionStatus("Active - Listening for 'Hey Lumina'");
+          // Brief acoustic cooldown (350ms) to allow speaker echo/room reverberation to fade
           setTimeout(() => {
-            safeStartRecognition();
-          }, 400);
+            if (isEnabledRef.current && !isSpeakingRef.current) {
+              safeStartRecognitionRef.current();
+            }
+          }, 350);
         } else {
           setStatus('disabled');
+          setConnectionStatus('Standby (Click Start Listening)');
         }
         if (onDone) onDone();
       };
 
       utterance.onerror = (e) => {
-        console.warn('VoiceAssistant TTS error:', e);
+        console.warn('VoiceAssistant speech error:', e);
         isSpeakingRef.current = false;
         isProcessingRef.current = false;
         wakeWordTriggeredRef.current = false;
@@ -216,250 +400,469 @@ export function VoiceAssistant({
 
         if (isEnabledRef.current) {
           setStatus('idle_listening');
+          setConnectionStatus("Active - Listening for 'Hey Lumina'");
           setTimeout(() => {
-            safeStartRecognition();
-          }, 400);
+            if (isEnabledRef.current && !isSpeakingRef.current) {
+              safeStartRecognitionRef.current();
+            }
+          }, 350);
         }
         if (onDone) onDone();
       };
 
-      window.speechSynthesis.speak(utterance);
+      try {
+        if (window.speechSynthesis.speaking || window.speechSynthesis.pending) {
+          window.speechSynthesis.cancel();
+        }
+        window.speechSynthesis.speak(utterance);
+      } catch (speechErr) {
+        console.warn('VoiceAssistant speech synthesis error:', speechErr);
+        isSpeakingRef.current = false;
+        if (onDone) onDone();
+      }
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [safeStopRecognition]
   );
 
   /**
-   * Checks if user command is a direct verbal request to navigate tabs
+   * Helper to stream standard conversational / consultation queries via Gemini API
    */
-  const handleVoiceNavigation = useCallback(
-    (cmd: string): boolean => {
-      const lower = cmd.toLowerCase();
-      if (!onNavigateTab) return false;
+  const streamConversationalQuery = useCallback(
+    async (
+      queryText: string,
+      currentTab: string,
+      activeStreamingFn: any,
+      notifyResponse: any,
+      speakFn: any
+    ) => {
+      // Check active tab context
+      const isExplainItSimply =
+        currentTab === 'jargon' ||
+        currentTab?.toLowerCase().includes('explain') ||
+        currentTab?.toLowerCase().includes('jargon');
 
-      if (
-        lower.includes('doctor note') ||
-        lower.includes('medical note') ||
-        lower.includes('explain note') ||
-        lower.includes('translate') ||
-        lower.includes('prescription') ||
-        lower.includes('medical bill') ||
-        lower.includes('explain it simply')
-      ) {
-        onNavigateTab('jargon');
-        const reply = 'Switching to Medical and Document Translator.';
-        setAssistantResponse(reply);
-        speakAloud(reply);
-        return true;
+      let promptContext: string;
+
+      if (isExplainItSimply) {
+        promptContext = `[Context: Active Screen is "Explain It Simply" (Medical & Document Translator)]\nUser Spoken Voice Command: "${queryText}"\nPlease translate and explain the document, prescription, lab test, or medical details in senior-friendly, reassuring plain English with clear, practical steps and any urgent red flags.`;
+      } else {
+        const tabDescriptions: Record<string, string> = {
+          scam: 'Active Screen is "Check A Message" (Scam & Safety Guardian)',
+          rhythm: 'Active Screen is "My Daily Rhythm" (Routine & Wellness Check)',
+          task: 'Active Screen is "Walk Me Through It" (Step-by-Step Task Guide)',
+          companion: 'Active Screen is "Friendly Companion" (Voice & Warm Chat)',
+        };
+        const activeDesc = tabDescriptions[currentTab] || `Active Screen is "${currentTab}"`;
+        promptContext = `[Context: ${activeDesc}]\nUser Spoken Voice Command: "${queryText}"\nPlease provide a clear, supportive, and accessible answer.`;
       }
 
-      if (
-        lower.includes('scam') ||
-        lower.includes('fraud') ||
-        lower.includes('suspicious') ||
-        lower.includes('check a message') ||
-        lower.includes('check text')
-      ) {
-        onNavigateTab('scam');
-        const reply = 'Switching to Scam and Safety Guardian.';
-        setAssistantResponse(reply);
-        speakAloud(reply);
-        return true;
+      setAssistantResponse('Consulting Gemini AI...');
+      setConnectionStatus('Consulting Lumina knowledge base...');
+
+      if (abortStreamRef.current) {
+        abortStreamRef.current();
+        abortStreamRef.current = null;
       }
 
-      if (
-        lower.includes('daily rhythm') ||
-        lower.includes('routine') ||
-        lower.includes('schedule') ||
-        lower.includes('hydration') ||
-        lower.includes('morning check')
-      ) {
-        onNavigateTab('rhythm');
-        const reply = 'Switching to My Daily Rhythm and Routines.';
-        setAssistantResponse(reply);
-        speakAloud(reply);
-        return true;
-      }
+      const streamingService = activeStreamingFn || adaptiveConsultStream;
+      const payload: Record<string, any> = { query: promptContext, text: promptContext };
 
-      if (
-        lower.includes('task guide') ||
-        lower.includes('how to') ||
-        lower.includes('step by step') ||
-        lower.includes('instructions')
-      ) {
-        onNavigateTab('task');
-        const reply = 'Switching to Step-by-Step Task Guide.';
-        setAssistantResponse(reply);
-        speakAloud(reply);
-        return true;
-      }
-
-      if (
-        lower.includes('companion chat') ||
-        lower.includes('talk to me') ||
-        lower.includes('friendly chat')
-      ) {
-        onNavigateTab('companion');
-        const reply = 'Switching to Companion Chat.';
-        setAssistantResponse(reply);
-        speakAloud(reply);
-        return true;
-      }
-
-      if (onChangeFontSize) {
-        if (
-          lower.includes('make text huge') ||
-          lower.includes('maximum size') ||
-          lower.includes('biggest size') ||
-          lower.includes('extra large') ||
-          lower.includes('size huge') ||
-          lower.includes('size a plus plus') ||
-          lower.includes('a++')
-        ) {
-          onChangeFontSize('huge');
-          const reply = 'Text size changed to Extra Large A plus plus.';
-          setAssistantResponse(reply);
-          speakAloud(reply);
-          return true;
+      const streamingPromise = (streamingService as any)(
+        payload,
+        (accumulated: string) => {
+          setAssistantResponse(accumulated);
+        },
+        (fullText: string) => {
+          setAssistantResponse(fullText);
+          if (notifyResponse) {
+            notifyResponse(queryText, fullText);
+          }
+          if (speakFn) {
+            speakFn(fullText);
+          }
+        },
+        (err: Error) => {
+          console.error('[VoiceAssistant API Connection Error]:', err);
+          const technicalBadge = 'API Key missing or invalid in server.ts';
+          showRedToast(technicalBadge);
+          setErrorMessage(technicalBadge);
+          setStatus('error');
+          setConnectionStatus(technicalBadge);
+          isProcessingRef.current = false;
+          // Strictly DO NOT speak "trouble reaching service"
         }
+      );
 
-        if (
-          lower.includes('make text bigger') ||
-          lower.includes('make text large') ||
-          lower.includes('larger text') ||
-          lower.includes('increase font') ||
-          lower.includes('size large') ||
-          lower.includes('size a plus') ||
-          lower.includes('a+')
-        ) {
-          onChangeFontSize('large');
-          const reply = 'Text size changed to Large A plus.';
-          setAssistantResponse(reply);
-          speakAloud(reply);
-          return true;
-        }
-
-        if (
-          lower.includes('standard size') ||
-          lower.includes('normal size') ||
-          lower.includes('reset size') ||
-          lower.includes('default size') ||
-          lower.includes('smaller text') ||
-          lower.includes('standard text')
-        ) {
-          onChangeFontSize('normal');
-          const reply = 'Text size reset to Standard.';
-          setAssistantResponse(reply);
-          speakAloud(reply);
-          return true;
-        }
+      const cancelFn = await Promise.resolve(streamingPromise);
+      if (typeof cancelFn === 'function') {
+        abortStreamRef.current = cancelFn;
       }
-
-      return false;
     },
-    [onNavigateTab, onChangeFontSize, speakAloud]
+    [showRedToast]
   );
 
   /**
-   * Sends the FULL, extracted command into Gemini API, adapting to the user's active tab.
-   * Prevents premature execution and identical repeat triggers.
+   * Action Execution & Intent Router:
+   * 1. Immediate visual feedback ('Processing...') so user knows command was accepted.
+   * 2. Sends transcript to Gemini API with response_mime_type: "application/json" for Intent Classification.
+   * 3. Switch statement:
+   *    - CHANGE_FONT: dynamically updates the app's CSS font-size state instead of writing text to the screen.
+   *    - CHANGE_TAB: switches screen views.
+   *    - ASSISTANT_QUERY: routes the text to the standard conversational API flow.
    */
-  const executeFullCommand = useCallback(
+  const executeVoiceCommand = useCallback(
     async (rawCommand: string) => {
       const cleanCommand = rawCommand
         .replace(/^[\s,.:;!?-]+/, '')
         .replace(/[\s,.:;!?-]+$/, '')
         .trim();
 
-      if (!cleanCommand || cleanCommand.length < 3) {
+      if (!cleanCommand || cleanCommand.length < 2) {
         wakeWordTriggeredRef.current = false;
         setStatus('idle_listening');
+        setConnectionStatus("Active - Listening for 'Hey Lumina'");
         return;
       }
 
       const now = Date.now();
-      // Strict Deduplication: Do not re-run identical command within 8 seconds
+      // Deduplicate: avoid executing identical command twice within 3.5 seconds
       if (
         cleanCommand.toLowerCase() === lastProcessedCommandRef.current.toLowerCase() &&
-        now - lastProcessedTimeRef.current < 8000
+        now - lastProcessedTimeRef.current < 3500
       ) {
-        console.log('VoiceAssistant: Suppressing duplicate trigger for command:', cleanCommand);
         wakeWordTriggeredRef.current = false;
         setStatus('idle_listening');
+        setConnectionStatus("Active - Listening for 'Hey Lumina'");
         return;
       }
 
-      // Check re-entrancy lock
       if (isProcessingRef.current || isSpeakingRef.current) {
         return;
       }
 
+      // 1. Immediately provide visual UI feedback so user knows command was accepted
       isProcessingRef.current = true;
       lastProcessedCommandRef.current = cleanCommand;
       lastProcessedTimeRef.current = now;
 
       setExtractedCommand(cleanCommand);
+      setLiveTranscript('');
       setStatus('processing');
+      setConnectionStatus('Analyzing intent with Gemini...');
       safeStopRecognition();
 
-      if (onCommandTriggered) {
-        onCommandTriggered(cleanCommand);
+      // Read most up-to-date versions from latestActionRef to eliminate stale closure bugs
+      const currentTab = latestActionRef.current.activeTab;
+      const streamingFn = latestActionRef.current.geminiStreamingFn || adaptiveConsultStream;
+      const onCmdTriggered = latestActionRef.current.onCommandTriggered;
+      const onRespReceived = latestActionRef.current.onResponseReceived;
+      const navFn = latestActionRef.current.onNavigateTab;
+      const fontFn = latestActionRef.current.onChangeFontSize;
+      const speakFn = latestActionRef.current.speakAloud;
+
+      if (onCmdTriggered) {
+        onCmdTriggered(cleanCommand);
       }
 
-      // Check if user requested voice navigation first
-      if (handleVoiceNavigation(cleanCommand)) {
-        return;
+      // =========================================================================
+      // 2. INSTANT LOCAL ACTION ROUTING (Zero Server Dependency)
+      // For basic UI commands, do not make an external network call.
+      // Handle them instantly with local client-side regex matching:
+      // =========================================================================
+
+      // A. Font size adjustments: if transcript matches /larger|bigger|increase font|huge/i -> trigger font size increase.
+      if (/larger|bigger|increase font|huge/i.test(cleanCommand)) {
+        const isHuge = /huge|maximum|biggest/i.test(cleanCommand);
+        const targetSize: 'large' | 'huge' = isHuge ? 'huge' : 'large';
+        if (fontFn) {
+          fontFn(targetSize);
+        }
+        const feedback = targetSize === 'huge' ? 'Text size changed to Extra Large.' : 'Text size changed to Large.';
+        setAssistantResponse('');
+        setConnectionStatus(feedback);
+        setStatus('idle_listening');
+        isProcessingRef.current = false;
+        if (speakFn) {
+          speakFn(feedback, () => {
+            if (isEnabledRef.current) {
+              safeStartRecognitionRef.current();
+            }
+          });
+        } else if (isEnabledRef.current) {
+          safeStartRecognitionRef.current();
+        }
+        return; // Zero external network call!
       }
 
-      try {
-        // Tab Context Injection: inform Gemini what view the user is looking at
-        const tabContextMap: Record<string, string> = {
-          jargon: 'The user is on the "Explain It Simply" screen, looking at medical notes, lab results, prescriptions, or bills.',
-          scam: 'The user is on the "Check A Message" screen, reviewing a suspicious text, call, or email.',
-          rhythm: 'The user is on the "My Daily Rhythm" screen, managing daily routines, medications, hydration, and gentle check-ins.',
-          task: 'The user is on the "Step-by-Step Task Guide" screen, learning how to do an everyday digital or household task.',
-          companion: 'The user is on the "Companion Chat" screen, having a warm, friendly conversation.',
+      // Also support font size reset/decrease locally
+      if (/smaller|decrease font|reset font|normal font|standard font/i.test(cleanCommand)) {
+        if (fontFn) {
+          fontFn('normal');
+        }
+        const feedback = 'Text size reset to Standard.';
+        setAssistantResponse('');
+        setConnectionStatus(feedback);
+        setStatus('idle_listening');
+        isProcessingRef.current = false;
+        if (speakFn) {
+          speakFn(feedback, () => {
+            if (isEnabledRef.current) {
+              safeStartRecognitionRef.current();
+            }
+          });
+        } else if (isEnabledRef.current) {
+          safeStartRecognitionRef.current();
+        }
+        return; // Zero external network call!
+      }
+
+      // B. Tab switching: handle direct tab commands or "switch tab" / "next tab"
+      if (/(?:switch|change|next)\s+tab/i.test(cleanCommand)) {
+        const tabList: Array<'jargon' | 'scam' | 'rhythm' | 'task' | 'companion'> = [
+          'jargon',
+          'scam',
+          'rhythm',
+          'task',
+          'companion',
+        ];
+        const tabLabels: Record<string, string> = {
+          jargon: 'Explain It Simply',
+          scam: 'Check A Message',
+          rhythm: 'My Daily Rhythm',
+          task: 'Walk Me Through It',
+          companion: 'Friendly Companion',
         };
-
-        const activeContext = tabContextMap[activeTab] || '';
-        const contextualQuery = activeContext
-          ? `[Context: ${activeContext}] Spoken Voice Command: "${cleanCommand}"`
-          : cleanCommand;
-
-        // Query Gemini API with user-calibrated pacing
-        const result = await adaptiveConsult({
-          query: contextualQuery,
-        });
-
-        let answerText = result.headline || '';
-        if (result.primaryPoints && result.primaryPoints.length > 0) {
-          answerText += '. ' + result.primaryPoints.join('. ');
+        const currentIdx = tabList.indexOf(currentTab as any);
+        const nextTab = tabList[(currentIdx + 1) % tabList.length];
+        if (navFn) {
+          navFn(nextTab);
         }
-        if (result.detailedContent) {
-          answerText += '. ' + result.detailedContent;
+        const feedback = `Switching to ${tabLabels[nextTab]}.`;
+        setAssistantResponse('');
+        setConnectionStatus(feedback);
+        setStatus('idle_listening');
+        isProcessingRef.current = false;
+        if (speakFn) {
+          speakFn(feedback, () => {
+            if (isEnabledRef.current) {
+              safeStartRecognitionRef.current();
+            }
+          });
+        } else if (isEnabledRef.current) {
+          safeStartRecognitionRef.current();
+        }
+        return; // Zero external network call!
+      }
+
+      if (/(?:go to|open|switch to|switch|show|view)/i.test(cleanCommand)) {
+        let targetTab: 'jargon' | 'scam' | 'rhythm' | 'task' | 'companion' | null = null;
+        let tabLabel = '';
+
+        if (/scam|check a message|message|fraud|safety/i.test(cleanCommand)) {
+          targetTab = 'scam';
+          tabLabel = 'Check A Message';
+        } else if (/daily rhythm|rhythm|routine|schedule|wellness/i.test(cleanCommand)) {
+          targetTab = 'rhythm';
+          tabLabel = 'My Daily Rhythm';
+        } else if (/walk me through|task|guide|step by step|how to/i.test(cleanCommand)) {
+          targetTab = 'task';
+          tabLabel = 'Walk Me Through It';
+        } else if (/friendly companion|companion|chat|friend|talk/i.test(cleanCommand)) {
+          targetTab = 'companion';
+          tabLabel = 'Friendly Companion';
+        } else if (/explain it simply|explain|jargon|medical|doctor|prescription|bill|notes/i.test(cleanCommand)) {
+          targetTab = 'jargon';
+          tabLabel = 'Explain It Simply';
         }
 
-        setAssistantResponse(answerText);
-
-        if (onResponseReceived) {
-          onResponseReceived(cleanCommand, answerText);
+        if (targetTab) {
+          if (navFn) {
+            navFn(targetTab);
+          }
+          const feedback = `Switching to ${tabLabel}.`;
+          setAssistantResponse('');
+          setConnectionStatus(feedback);
+          setStatus('idle_listening');
+          isProcessingRef.current = false;
+          if (speakFn) {
+            speakFn(feedback, () => {
+              if (isEnabledRef.current) {
+                safeStartRecognitionRef.current();
+              }
+            });
+          } else if (isEnabledRef.current) {
+            safeStartRecognitionRef.current();
+          }
+          return; // Zero external network call!
         }
+      }
 
-        // Multimodal Feedback: Read answer aloud with calm rate
-        speakAloud(answerText);
+      // C. Fallback to Gemini only for free-form conversational or explanatory questions.
+      try {
+        // AI Intent Router (JSON Action Parsing):
+        // Send transcript to Gemini API with response_mime_type: "application/json"
+        const intent: VoiceIntentResult = await routeVoiceIntent(cleanCommand);
+
+        // Action Execution Logic:
+        // Switch statement intercepting Gemini's JSON response
+        switch (intent.action) {
+          case 'CHANGE_FONT': {
+            // Dynamically update the app's CSS font-size state instead of writing text to the screen!
+            const val = (intent.value || '').toUpperCase();
+            let targetSize: 'normal' | 'large' | 'huge' = 'large';
+            let feedback = 'Text size changed to Large.';
+
+            if (val.includes('A++') || val.includes('HUGE') || val.includes('MAX') || val.includes('EXTRA')) {
+              targetSize = 'huge';
+              feedback = 'Text size changed to Extra Large.';
+            } else if (
+              val.includes('DEFAULT') ||
+              val.includes('NORMAL') ||
+              val.includes('RESET') ||
+              val.includes('STANDARD') ||
+              val.includes('A-') ||
+              val.includes('SMALL')
+            ) {
+              targetSize = 'normal';
+              feedback = 'Text size reset to Standard.';
+            } else {
+              targetSize = 'large';
+              feedback = 'Text size changed to Large.';
+            }
+
+            if (fontFn) {
+              fontFn(targetSize);
+            }
+
+            setAssistantResponse('');
+            const statusWithNotice = intent.debugNotice ? `${feedback} (${intent.debugNotice})` : feedback;
+            setConnectionStatus(statusWithNotice);
+
+            if (speakFn) {
+              speakFn(feedback, () => {
+                isProcessingRef.current = false;
+                if (isEnabledRef.current) {
+                  setStatus('idle_listening');
+                  setConnectionStatus(statusWithNotice);
+                  safeStartRecognitionRef.current();
+                }
+              });
+            } else {
+              isProcessingRef.current = false;
+              if (isEnabledRef.current) {
+                setStatus('idle_listening');
+                setConnectionStatus(statusWithNotice);
+                safeStartRecognitionRef.current();
+              }
+            }
+            break;
+          }
+
+          case 'CHANGE_TAB': {
+            const val = (intent.value || '').toLowerCase();
+            let targetTab: 'jargon' | 'scam' | 'rhythm' | 'task' | 'companion' = 'jargon';
+            let tabLabel = 'Explain It Simply';
+
+            if (val.includes('scam') || val.includes('message') || val.includes('check')) {
+              targetTab = 'scam';
+              tabLabel = 'Check A Message';
+            } else if (val.includes('rhythm') || val.includes('daily') || val.includes('routine') || val.includes('schedule')) {
+              targetTab = 'rhythm';
+              tabLabel = 'My Daily Rhythm';
+            } else if (val.includes('task') || val.includes('walk') || val.includes('step') || val.includes('guide')) {
+              targetTab = 'task';
+              tabLabel = 'Walk Me Through It';
+            } else if (val.includes('companion') || val.includes('chat') || val.includes('friend')) {
+              targetTab = 'companion';
+              tabLabel = 'Friendly Companion';
+            } else {
+              targetTab = 'jargon';
+              tabLabel = 'Explain It Simply';
+            }
+
+            if (navFn) {
+              navFn(targetTab);
+            }
+
+            const feedback = `Switching to ${tabLabel}.`;
+            setAssistantResponse('');
+            const statusWithNotice = intent.debugNotice ? `${feedback} (${intent.debugNotice})` : feedback;
+            setConnectionStatus(statusWithNotice);
+
+            if (speakFn) {
+              speakFn(feedback, () => {
+                isProcessingRef.current = false;
+                if (isEnabledRef.current) {
+                  setStatus('idle_listening');
+                  setConnectionStatus(statusWithNotice);
+                  safeStartRecognitionRef.current();
+                }
+              });
+            } else {
+              isProcessingRef.current = false;
+              if (isEnabledRef.current) {
+                setStatus('idle_listening');
+                setConnectionStatus(statusWithNotice);
+                safeStartRecognitionRef.current();
+              }
+            }
+            break;
+          }
+
+          case 'ASSISTANT_QUERY':
+          default: {
+            // Route the text to the standard conversational API flow
+            const queryText = intent.value || cleanCommand;
+            await streamConversationalQuery(queryText, currentTab, streamingFn, onRespReceived, speakFn);
+            break;
+          }
+        }
       } catch (err: any) {
-        console.error('VoiceAssistant Gemini API error:', err);
-        const fallbackError = 'I am having a moment reaching the consultation service. Please try again.';
-        setErrorMessage(fallbackError);
+        console.error('[VoiceAssistant API Connection Error]:', err);
+        const technicalBadge = 'API Key missing or invalid in server.ts';
+        showRedToast(technicalBadge);
+        setErrorMessage(technicalBadge);
         setStatus('error');
-        speakAloud(fallbackError);
+        setConnectionStatus(technicalBadge);
+        isProcessingRef.current = false;
+        // Strictly DO NOT speak "trouble reaching service"
       }
     },
-    [activeTab, handleVoiceNavigation, onCommandTriggered, onResponseReceived, safeStopRecognition, speakAloud]
+    [safeStopRecognition, streamConversationalQuery, showRedToast]
   );
 
+  // =========================================================================
+  // CORE FIX: latestActionRef to eliminate Stale Closure bugs in SpeechRecognition
+  // =========================================================================
+  interface LatestActionRefState {
+    activeTab: string;
+    geminiStreamingFn?: GeminiStreamingFn;
+    executeVoiceCommand: (command: string) => Promise<void>;
+    onCommandTriggered?: (command: string) => void;
+    onResponseReceived?: (command: string, response: string) => void;
+    onNavigateTab?: (tab: 'jargon' | 'scam' | 'rhythm' | 'task' | 'companion') => void;
+    onChangeFontSize?: (size: 'normal' | 'large' | 'huge') => void;
+    speakAloud: (text: string, onDone?: () => void) => void;
+  }
+
+  const latestActionRef = useRef<LatestActionRefState>({} as LatestActionRefState);
+
+  // Update this ref on EVERY render so speech recognition callbacks always access the freshest state
+  latestActionRef.current = {
+    activeTab,
+    geminiStreamingFn,
+    executeVoiceCommand,
+    onCommandTriggered,
+    onResponseReceived,
+    onNavigateTab,
+    onChangeFontSize,
+    speakAloud,
+  };
+
   /**
-   * Initializes native speech recognition engine with continuous listening
+   * Initializes the native SpeechRecognition engine.
+   * Reads from latestActionRef.current inside recognition.onresult to prevent stale closures.
    */
   const initRecognition = useCallback(() => {
     if (typeof window === 'undefined') return null;
@@ -468,7 +871,8 @@ export function VoiceAssistant({
       (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
 
     if (!SpeechRecognition) {
-      setErrorMessage('Speech recognition is not supported in this browser. Use Chrome, Edge, or Safari.');
+      setErrorMessage('Speech recognition is not supported in this browser. Please use Chrome, Edge, or Safari.');
+      setConnectionStatus('Browser Not Supported');
       setStatus('error');
       return null;
     }
@@ -480,15 +884,30 @@ export function VoiceAssistant({
     recognition.maxAlternatives = 1;
 
     recognition.onstart = () => {
+      lastStartTimeRef.current = Date.now();
       setErrorMessage(null);
+
       if (!isSpeakingRef.current && !isProcessingRef.current) {
         setStatus('idle_listening');
+        if (manualBypassRef.current) {
+          setConnectionStatus("Direct Listening Active - Speak your command or say 'Hey Lumina'");
+        } else {
+          setConnectionStatus("Active - Listening for 'Hey Lumina'");
+        }
       }
     };
 
+    /**
+     * Speech Recognition Result Event:
+     * Reads from latestActionRef.current to guarantee current tab state and streaming function.
+     */
     recognition.onresult = (event: any) => {
-      // Discard all inputs while processing or speaking to prevent self-trigger and echoes
-      if (isSpeakingRef.current || isProcessingRef.current) {
+      // Discard inputs while speaking or processing to prevent acoustic feedback / self-triggering
+      if (
+        isSpeakingRef.current ||
+        isProcessingRef.current ||
+        (typeof window !== 'undefined' && window.speechSynthesis?.speaking)
+      ) {
         return;
       }
 
@@ -506,105 +925,169 @@ export function VoiceAssistant({
       }
 
       const activeText = (final + interim).trim();
+      if (!activeText) return;
+
+      // Update real-time Live Transcript Preview
       setLiveTranscript(activeText);
 
-      const normalizedTranscript = activeText.toLowerCase();
-      const normalizedWakeWord = wakeWord.toLowerCase().trim();
+      // =========================================================================
+      // 1. MANUAL WAKE-WORD BYPASS:
+      // If the user physically clicked "Start Listening", bypass the 'Hey Lumina' regex
+      // requirement for the very next spoken phrase. Treat their immediate input as a direct command!
+      // =========================================================================
+      if (manualBypassRef.current) {
+        // Check if the user also spoke the wake word or not
+        const matchResult = extractVoiceCommand(activeText, wakeWord);
+        const directCommand = matchResult.matched && matchResult.command ? matchResult.command : activeText;
 
-      // 1. Check if wake word is present in the current speech buffer
-      const wakeWordIndex = normalizedTranscript.indexOf(normalizedWakeWord);
+        wakeWordTriggeredRef.current = true;
+        accumulatedCommandRef.current = directCommand;
 
-      if (wakeWordIndex !== -1) {
-        // First time seeing wake word in this session
-        if (!wakeWordTriggeredRef.current) {
-          wakeWordTriggeredRef.current = true;
-          SoundEffects.playSoftChime(); // Gentle non-verbal chime confirmation
-          setStatus('listening_full_command');
-        }
+        setStatus('listening_full_command');
+        setConnectionStatus('Direct command active - Listening...');
 
-        // Extract everything after the wake word
-        const afterWakeWord = activeText.slice(wakeWordIndex + wakeWord.length).trim();
-        accumulatedCommandRef.current = afterWakeWord;
-
-        // Clear existing silence timer
         if (silenceTimerRef.current) {
           clearTimeout(silenceTimerRef.current);
         }
 
-        // If user spoke a command after the wake word, wait for 1200ms of silence before finalizing!
-        // This ensures the user can finish speaking their full sentence without getting cut off!
-        if (afterWakeWord.length > 2) {
-          silenceTimerRef.current = setTimeout(() => {
-            if (wakeWordTriggeredRef.current && accumulatedCommandRef.current.length > 2) {
-              const fullCmd = accumulatedCommandRef.current;
-              wakeWordTriggeredRef.current = false;
-              accumulatedCommandRef.current = '';
-              executeFullCommand(fullCmd);
-            }
-          }, 1200);
-        } else {
-          // User just said "Hey Lumina" and paused.
-          // Wait 3 seconds. If still no command, gently ask "I am listening".
-          if (waitTimeoutRef.current) clearTimeout(waitTimeoutRef.current);
-          waitTimeoutRef.current = setTimeout(() => {
-            if (wakeWordTriggeredRef.current && accumulatedCommandRef.current.length === 0) {
-              if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
-                const promptUtterance = new SpeechSynthesisUtterance('I am listening. What can I help you with?');
-                promptUtterance.rate = 0.9;
-                window.speechSynthesis.speak(promptUtterance);
-              }
-            }
-          }, 3000);
-        }
-      } else if (wakeWordTriggeredRef.current) {
-        // Wake word was triggered earlier, user is currently speaking their command
-        accumulatedCommandRef.current = activeText;
-        if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
-
         silenceTimerRef.current = setTimeout(() => {
-          if (wakeWordTriggeredRef.current && accumulatedCommandRef.current.length > 2) {
-            const fullCmd = accumulatedCommandRef.current;
+          if (accumulatedCommandRef.current.trim().length > 1) {
+            const cmdToExecute = accumulatedCommandRef.current.trim();
+            // Disarm manual bypass after the very next command is accepted
+            manualBypassRef.current = false;
+            setIsManualBypassActive(false);
             wakeWordTriggeredRef.current = false;
             accumulatedCommandRef.current = '';
-            executeFullCommand(fullCmd);
+            // Read from latestActionRef.current to eliminate stale closures
+            latestActionRef.current.executeVoiceCommand(cmdToExecute);
           }
-        }, 1200);
+        }, 900);
+        return;
+      }
+
+      // 2. Standard Hands-Free Wake-Word Detection
+      if (!wakeWordTriggeredRef.current) {
+        const matchResult = extractVoiceCommand(activeText, wakeWord);
+
+        if (matchResult.matched) {
+          wakeWordTriggeredRef.current = true;
+          // Play instant Web Audio API 440Hz beep chime for 120ms
+          playWakeChime(audioCtxRef);
+
+          setStatus('listening_full_command');
+          setConnectionStatus('Heard wake word! Listening for your command...');
+
+          const trailingCommand = matchResult.command;
+          accumulatedCommandRef.current = trailingCommand;
+
+          if (silenceTimerRef.current) {
+            clearTimeout(silenceTimerRef.current);
+          }
+
+          // If the user spoke their command in the same breath (e.g. 'Hey Lumina explain this document')
+          if (trailingCommand.length > 2) {
+            silenceTimerRef.current = setTimeout(() => {
+              if (wakeWordTriggeredRef.current && accumulatedCommandRef.current.length > 2) {
+                const cmdToExecute = accumulatedCommandRef.current;
+                wakeWordTriggeredRef.current = false;
+                accumulatedCommandRef.current = '';
+                // Read from latestActionRef.current to eliminate stale closures
+                latestActionRef.current.executeVoiceCommand(cmdToExecute);
+              }
+            }, 900);
+          }
+        }
+      } else {
+        // Wake word was previously triggered in this session; accumulate trailing command
+        const matchResult = extractVoiceCommand(activeText, wakeWord);
+        const trailingCommand = matchResult.matched ? matchResult.command : activeText;
+        accumulatedCommandRef.current = trailingCommand;
+
+        if (silenceTimerRef.current) {
+          clearTimeout(silenceTimerRef.current);
+        }
+
+        // Wait 900ms after user pauses speaking before finalizing and executing the voice command
+        silenceTimerRef.current = setTimeout(() => {
+          if (wakeWordTriggeredRef.current && accumulatedCommandRef.current.length > 1) {
+            const cmdToExecute = accumulatedCommandRef.current;
+            wakeWordTriggeredRef.current = false;
+            accumulatedCommandRef.current = '';
+            // Read from latestActionRef.current to eliminate stale closures
+            latestActionRef.current.executeVoiceCommand(cmdToExecute);
+          }
+        }, 900);
       }
     };
 
+    /**
+     * Strict error recovery without terminating component lifecycle
+     */
     recognition.onerror = (event: any) => {
       const err = event.error;
 
-      // 'no-speech' is a standard silent pause event in continuous mode; ignore without disruption
+      // 'no-speech' is normal browser silence; ignore without disruption
       if (err === 'no-speech') {
         return;
       }
 
-      if (err === 'not-allowed' || err === 'service-not-allowed') {
-        setErrorMessage('Microphone access was denied. Please allow microphone permissions in your browser address bar.');
-        setIsEnabled(false);
-        setStatus('disabled');
+      // 'aborted' occurs normally during manual toggling, TTS interruption, or tab switching
+      if (err === 'aborted') {
         return;
       }
 
+      // 'not-allowed' or permission denied
+      if (err === 'not-allowed' || err === 'service-not-allowed') {
+        setErrorMessage('Microphone access was blocked. Please click the lock or settings icon in your browser address bar to allow audio.');
+        setConnectionStatus('Microphone Blocked');
+        setIsEnabled(false);
+        manualBypassRef.current = false;
+        setIsManualBypassActive(false);
+        setStatus('error');
+        return;
+      }
+
+      // Network hiccups: keep component alive and attempt backoff restart
       if (err === 'network') {
-        setErrorMessage('Voice recognition encountered a temporary network glitch. Retrying...');
+        setConnectionStatus('Network Glitch - Reconnecting...');
+      } else {
+        console.warn('VoiceAssistant recognition notice:', err);
       }
     };
 
+    /**
+     * Auto-restart loop with exponential backoff on silence/shutdown
+     */
     recognition.onend = () => {
-      // If continuous listening is enabled and we are not speaking or processing, revive listening cleanly!
+      // If hands-free mode is toggled ON and not speaking/processing, seamlessly restart
       if (isEnabledRef.current && !isSpeakingRef.current && !isProcessingRef.current) {
+        const timeSinceStart = Date.now() - lastStartTimeRef.current;
+
+        // If restarting repeatedly within 1200ms, increase backoff to prevent CPU spin
+        if (timeSinceStart < 1200) {
+          backoffCountRef.current = Math.min(backoffCountRef.current + 1, 5);
+        } else {
+          backoffCountRef.current = 0;
+        }
+
+        const delay = Math.max(150, Math.min(4000, 200 * Math.pow(1.5, backoffCountRef.current)));
+        setConnectionStatus('Restarting listener...');
+
         if (restartTimerRef.current) clearTimeout(restartTimerRef.current);
         restartTimerRef.current = setTimeout(() => {
-          safeStartRecognition();
-        }, 300);
+          if (isEnabledRef.current && !isSpeakingRef.current && !isProcessingRef.current) {
+            safeStartRecognition();
+          }
+        }, delay);
       }
     };
 
     return recognition;
-  }, [wakeWord, executeFullCommand]);
+  }, [wakeWord]);
 
+  /**
+   * Safely activates native speech recognition
+   */
   const safeStartRecognition = useCallback(() => {
     if (!isEnabledRef.current) return;
     if (isSpeakingRef.current || isProcessingRef.current) return;
@@ -617,56 +1100,96 @@ export function VoiceAssistant({
       try {
         recognitionRef.current.start();
       } catch (e: any) {
-        // Recognition is already active, ignore safely
+        // Recognition is already active or transitioning
       }
     }
   }, [initRecognition]);
 
+  safeStartRecognitionRef.current = safeStartRecognition;
+
   /**
-   * Prominent Toggle to Enable / Disable Hands-Free Assistant with explicit permission request
+   * Explicit "Start Listening" / Manual Activation Toggle
+   * 1. Temporarily arms manual wake-word bypass for the very next spoken phrase.
+   * 2. Satisfies browser autoplay and microphone user-activation security policies.
    */
-  const handleToggleAssistant = async () => {
-    SoundEffects.playSoftChime();
+  const handleToggleListening = async () => {
+    // Un-suspend AudioContext during direct user click
+    try {
+      const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
+      if (AudioCtx) {
+        if (!audioCtxRef.current || audioCtxRef.current.state === 'closed') {
+          audioCtxRef.current = new AudioCtx();
+        }
+        if (audioCtxRef.current.state === 'suspended') {
+          await audioCtxRef.current.resume();
+        }
+      }
+    } catch (e) {
+      // safe ignore
+    }
+
+    playWakeChime(audioCtxRef);
     const nextState = !isEnabled;
 
     if (nextState) {
-      // Explicitly request browser microphone permission first to avoid silent drops
+      // Explicitly test and request microphone access via getUserMedia
       if (navigator.mediaDevices?.getUserMedia) {
         try {
           const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-          // Release test stream so speech recognition has unobstructed hardware access
+          // Release track immediately so speech recognition has exclusive audio access
           stream.getTracks().forEach((track) => track.stop());
         } catch (permErr: any) {
-          console.warn('Microphone permission denied:', permErr);
-          setErrorMessage('Microphone access was denied. Please click the lock/camera icon in your address bar to allow audio.');
+          console.warn('Microphone permission check failed:', permErr);
+          setErrorMessage('Microphone access was denied. Please click the lock icon in your address bar to allow audio.');
+          setConnectionStatus('Microphone Blocked');
           setIsEnabled(false);
-          setStatus('disabled');
+          manualBypassRef.current = false;
+          setIsManualBypassActive(false);
+          setStatus('error');
           return;
         }
       }
 
+      // Enable manual wake-word bypass for the very next spoken phrase
+      manualBypassRef.current = true;
+      setIsManualBypassActive(true);
+
       setIsEnabled(true);
+      isEnabledRef.current = true;
       setErrorMessage(null);
       setStatus('idle_listening');
+      setConnectionStatus("Direct Listening Active - Speak your command or say 'Hey Lumina'");
       wakeWordTriggeredRef.current = false;
       accumulatedCommandRef.current = '';
       safeStartRecognition();
     } else {
       setIsEnabled(false);
+      isEnabledRef.current = false;
+      manualBypassRef.current = false;
+      setIsManualBypassActive(false);
       safeStopRecognition();
       stopSpeaking();
+      if (abortStreamRef.current) {
+        abortStreamRef.current();
+        abortStreamRef.current = null;
+      }
       setStatus('disabled');
+      setConnectionStatus('Standby (Click Start Listening)');
       setLiveTranscript('');
       wakeWordTriggeredRef.current = false;
       accumulatedCommandRef.current = '';
     }
   };
 
-  // Cross-Tab Visibility / Focus Recovery:
-  // When user switches browser tabs or returns to the window, revive recognition if it went dormant
+  // Cross-Tab Visibility / Focus Recovery
   useEffect(() => {
     const handleVisibilityChange = () => {
-      if (document.visibilityState === 'visible' && isEnabledRef.current && !isSpeakingRef.current && !isProcessingRef.current) {
+      if (
+        document.visibilityState === 'visible' &&
+        isEnabledRef.current &&
+        !isSpeakingRef.current &&
+        !isProcessingRef.current
+      ) {
         safeStartRecognition();
       }
     };
@@ -691,9 +1214,16 @@ export function VoiceAssistant({
     return () => {
       if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
       if (restartTimerRef.current) clearTimeout(restartTimerRef.current);
-      if (waitTimeoutRef.current) clearTimeout(waitTimeoutRef.current);
+      if (abortStreamRef.current) abortStreamRef.current();
       safeStopRecognition();
       stopSpeaking();
+      if (audioCtxRef.current && audioCtxRef.current.state !== 'closed') {
+        try {
+          audioCtxRef.current.close();
+        } catch (e) {
+          // ignore
+        }
+      }
     };
   }, [safeStopRecognition, stopSpeaking]);
 
@@ -701,30 +1231,72 @@ export function VoiceAssistant({
     <aside
       id="voice-assistant-floating-root"
       aria-label="Hands-free voice assistant"
-      className={`fixed bottom-5 right-4 sm:right-6 z-40 max-w-[94vw] sm:max-w-md transition-all duration-300 ${className}`}
+      className={`fixed top-3 right-3 sm:right-6 z-40 max-w-[calc(100vw-1.5rem)] sm:max-w-md transition-all duration-300 ${className}`}
     >
-      {/* Outer Floating Card */}
+      {/* Brief Red Toast Badge */}
+      {redToast && (
+        <div
+          role="alert"
+          aria-live="assertive"
+          className="mb-1.5 px-3 py-1.5 bg-red-600 border border-red-700 text-white font-bold text-xs rounded-xl shadow-lg flex items-center justify-between gap-2 animate-bounce"
+        >
+          <div className="flex items-center gap-1.5 truncate">
+            <AlertCircle className="w-3.5 h-3.5 shrink-0 text-white fill-red-600 stroke-white stroke-[2.5]" />
+            <span className="truncate">{redToast}</span>
+          </div>
+          <button
+            type="button"
+            onClick={() => setRedToast(null)}
+            className="p-0.5 hover:bg-red-700 rounded transition-colors cursor-pointer text-white"
+            aria-label="Dismiss Alert"
+          >
+            <X className="w-3 h-3" />
+          </button>
+        </div>
+      )}
+
+      {/* Immediate API Key Alert */}
+      {apiKeyAlert && (
+        <div
+          role="alert"
+          className="mb-1.5 px-3 py-1.5 bg-amber-500 text-slate-950 font-bold text-xs rounded-xl border border-amber-600 flex items-center justify-between gap-2 shadow-md"
+        >
+          <div className="flex items-center gap-1.5 truncate">
+            <AlertCircle className="w-3.5 h-3.5 shrink-0 fill-slate-950 text-amber-500" />
+            <span className="truncate">{apiKeyAlert}</span>
+          </div>
+          <button
+            type="button"
+            onClick={() => setApiKeyAlert(null)}
+            className="p-0.5 hover:bg-amber-600 rounded transition-colors cursor-pointer"
+            aria-label="Dismiss API Key Alert"
+          >
+            <X className="w-3 h-3" />
+          </button>
+        </div>
+      )}
+
+      {/* Slim Inline Horizontal Bar / Compact Pill */}
       <div
-        className={`rounded-3xl border-4 shadow-2xl transition-all overflow-hidden ${
+        className={`transition-all duration-200 shadow-md backdrop-blur-md border ${
+          isExpanded ? 'rounded-2xl shadow-xl' : 'rounded-full'
+        } ${
           isHighContrast
-            ? 'bg-[#060D17] border-amber-400 text-white ring-4 ring-amber-400/20'
-            : 'bg-white border-[#0A192F] text-[#0A192F] ring-4 ring-blue-900/10'
+            ? 'bg-slate-950/95 border-amber-400 text-white shadow-amber-400/10'
+            : 'bg-white/95 border-slate-300 dark:bg-slate-900/95 dark:border-slate-700 text-slate-800 dark:text-slate-100 shadow-slate-900/10'
         }`}
       >
-        {/* Main Status Header Bar */}
-        <div
-          className={`p-3.5 sm:p-4 flex items-center justify-between gap-3 border-b-2 ${
-            isHighContrast
-              ? 'bg-slate-900 border-slate-800'
-              : isEnabled
-              ? 'bg-[#EFF6FF] border-[#BFDBFE]'
-              : 'bg-[#F8FAFC] border-[#E2E8F0]'
-          }`}
-        >
-          {/* Status Indicator & Title */}
-          <div className="flex items-center gap-3 min-w-0">
-            <div
-              className={`p-2.5 rounded-xl border-2 shrink-0 transition-all ${
+        {/* Main Compact Control Strip */}
+        <div className="px-2.5 py-1 sm:px-3 sm:py-1.5 flex items-center justify-between gap-2 sm:gap-2.5">
+          {/* Quick Mic Icon & Shrunk Title */}
+          <div className="flex items-center gap-2 min-w-0">
+            <button
+              type="button"
+              id="btn-voice-assistant-header-mic"
+              onClick={handleToggleListening}
+              title={isEnabled ? 'Tap to turn off Voice Assistant' : 'Tap to turn on Voice Assistant'}
+              aria-label={isEnabled ? 'Turn off Voice Assistant' : 'Turn on Voice Assistant'}
+              className={`p-1 rounded-full border transition-all cursor-pointer shrink-0 focus:outline-none focus:ring-2 focus:ring-amber-400 ${
                 status === 'speaking'
                   ? 'bg-emerald-500 text-white border-emerald-300 animate-pulse'
                   : status === 'processing'
@@ -732,227 +1304,287 @@ export function VoiceAssistant({
                   : status === 'listening_full_command' || status === 'wake_word_detected'
                   ? 'bg-rose-600 text-white border-white animate-pulse'
                   : status === 'idle_listening'
-                  ? 'bg-[#0A192F] text-amber-400 border-[#1E3A8A]'
-                  : 'bg-slate-200 dark:bg-slate-800 text-slate-500 border-slate-300 dark:border-slate-700'
+                  ? 'bg-[#0A192F] text-amber-400 border-amber-400/50'
+                  : 'bg-slate-100 dark:bg-slate-800 text-slate-400 border-slate-300 dark:border-slate-700'
               }`}
             >
               {status === 'speaking' ? (
-                <Volume2 className="w-5 h-5 stroke-[2.5]" />
+                <Volume2 className="w-4 h-4 stroke-[2.2]" />
               ) : status === 'processing' ? (
-                <Loader2 className="w-5 h-5 stroke-[2.5] animate-spin" />
+                <Loader2 className="w-4 h-4 stroke-[2.2] animate-spin" />
               ) : isEnabled ? (
-                <Mic className="w-5 h-5 stroke-[2.5]" />
+                <Mic className="w-4 h-4 stroke-[2.2]" />
               ) : (
-                <MicOff className="w-5 h-5 stroke-[2.5]" />
+                <MicOff className="w-4 h-4 stroke-[2.2]" />
               )}
-            </div>
+            </button>
 
-            <div className="min-w-0">
-              <div className="flex items-center gap-2">
-                <span className="text-xs font-black uppercase tracking-wider text-[#D97706] dark:text-amber-300">
-                  Hands-Free Voice
+            {/* Shrunk 'HANDS-FREE ASSISTANT' and compact status */}
+            <div className="min-w-0 leading-tight">
+              <div className="flex items-center gap-1">
+                <span className="text-[10px] font-black uppercase tracking-wider text-[#D97706] dark:text-amber-300 truncate">
+                  Hands-Free
                 </span>
                 {isEnabled && (
-                  <span className="flex h-2 w-2 relative">
+                  <span className="flex h-1.5 w-1.5 relative shrink-0">
                     <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
-                    <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
+                    <span className="relative inline-flex rounded-full h-1.5 w-1.5 bg-emerald-500"></span>
                   </span>
                 )}
               </div>
-
-              {/* Status Badge Label */}
               <p
                 id="voice-assistant-status-text"
-                className="text-sm sm:text-base font-black truncate text-[#0A192F] dark:text-white"
+                className="text-[11px] font-bold truncate max-w-[85px] sm:max-w-[120px] text-slate-700 dark:text-slate-200"
               >
-                {!isEnabled && 'Voice Assistant Off'}
-                {isEnabled && status === 'idle_listening' && `Listening for "${wakeWord}"...`}
+                {!isEnabled && 'Off'}
+                {isEnabled && isManualBypassActive && status === 'idle_listening' && 'Direct'}
+                {isEnabled && !isManualBypassActive && status === 'idle_listening' && `"${wakeWord}"`}
                 {isEnabled &&
                   (status === 'listening_full_command' || status === 'wake_word_detected') &&
-                  'Heard wake word! Listening to your full sentence...'}
-                {isEnabled && status === 'processing' && 'Thinking & Consulting Lumina...'}
-                {isEnabled && status === 'speaking' && 'Speaking answer aloud...'}
-                {status === 'error' && 'Microphone Notice'}
+                  'Listening...'}
+                {isEnabled && status === 'processing' && 'Thinking...'}
+                {isEnabled && status === 'speaking' && 'Speaking...'}
+                {status === 'error' && 'Error'}
               </p>
             </div>
           </div>
 
-          {/* Header Action Controls */}
-          <div className="flex items-center gap-2 shrink-0">
+          {/* Action Controls: Shrunk 'Start/Stop' Button, Stop Audio (if speaking), Chevron Dropdown */}
+          <div className="flex items-center gap-1.5 shrink-0">
+            {/* Shrunk Stop Speaking Button */}
             {status === 'speaking' && (
               <button
                 type="button"
                 id="btn-voice-assistant-stop-speaking"
                 onClick={stopSpeaking}
-                className="px-2.5 py-1.5 rounded-lg bg-rose-600 hover:bg-rose-700 text-white text-xs font-black flex items-center gap-1 cursor-pointer transition-colors shadow-sm"
+                className="px-2 py-0.5 rounded-full bg-rose-600 hover:bg-rose-700 text-white text-[10px] sm:text-xs font-black flex items-center gap-1 cursor-pointer transition-colors shadow-xs"
                 title="Stop speaking"
                 aria-label="Stop speaking"
               >
-                <Square className="w-3.5 h-3.5 fill-white" />
+                <Square className="w-3 h-3 fill-white" />
                 <span>Stop</span>
               </button>
             )}
 
+            {/* Shrunk 'Start / Stop Listening' Button */}
+            <button
+              type="button"
+              id="btn-toggle-handsfree-assistant"
+              onClick={handleToggleListening}
+              className={`px-2.5 py-1 rounded-full text-[11px] sm:text-xs font-bold border transition-all flex items-center gap-1.5 cursor-pointer focus:outline-none focus:ring-2 focus:ring-amber-400 shrink-0 shadow-xs ${
+                isEnabled
+                  ? 'bg-rose-600 hover:bg-rose-700 text-white border-rose-700'
+                  : isHighContrast
+                  ? 'bg-amber-400 text-slate-950 hover:bg-amber-300 border-white font-extrabold'
+                  : 'bg-[#0A192F] hover:bg-[#1E3A8A] text-white border-[#0A192F]'
+              }`}
+              title={isEnabled ? 'Stop listening' : 'Start listening'}
+            >
+              {isEnabled ? (
+                <>
+                  <MicOff className="w-3.5 h-3.5 stroke-[2.2] shrink-0" />
+                  <span>Stop</span>
+                </>
+              ) : (
+                <>
+                  <Mic className="w-3.5 h-3.5 stroke-[2.2] shrink-0" />
+                  <span>Start</span>
+                </>
+              )}
+            </button>
+
+            {/* Tiny 'Chevron' Dropdown Button to toggle verbose info */}
             <button
               type="button"
               id="btn-voice-assistant-toggle-expand"
               onClick={() => setIsExpanded((prev) => !prev)}
-              className="p-2 rounded-xl text-slate-600 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-800 transition-colors cursor-pointer"
+              className="p-1 rounded-full text-slate-500 hover:text-slate-800 dark:text-slate-400 dark:hover:text-slate-100 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors cursor-pointer"
               aria-expanded={isExpanded}
-              aria-label={isExpanded ? 'Collapse voice assistant details' : 'Expand voice assistant details'}
-              title={isExpanded ? 'Collapse' : 'Expand details'}
+              aria-label={isExpanded ? 'Hide assistant details' : 'Show assistant details'}
+              title={isExpanded ? 'Hide details' : 'Show details'}
             >
-              {isExpanded ? (
-                <ChevronDown className="w-5 h-5 stroke-[2.5]" />
-              ) : (
-                <ChevronUp className="w-5 h-5 stroke-[2.5]" />
-              )}
+              <ChevronDown
+                className={`w-3.5 h-3.5 stroke-[2.5] transition-transform duration-200 ${
+                  isExpanded ? 'rotate-180' : ''
+                }`}
+              />
             </button>
           </div>
         </div>
 
-        {/* Prominent Enable / Disable Toggle Bar */}
-        <div
-          className={`px-4 py-3 border-b flex items-center justify-between gap-3 ${
-            isHighContrast
-              ? 'bg-slate-950 border-slate-800'
-              : 'bg-white border-[#E2E8F0]'
-          }`}
-        >
-          <div className="text-xs sm:text-sm font-bold opacity-90 truncate">
-            <span>Wake word: </span>
-            <code className="px-1.5 py-0.5 rounded-md bg-amber-100 dark:bg-amber-950 text-[#D97706] dark:text-amber-300 font-mono font-black">
-              &quot;{wakeWord}&quot;
-            </code>
-          </div>
-
-          <button
-            type="button"
-            id="btn-toggle-handsfree-assistant"
-            onClick={handleToggleAssistant}
-            className={`px-3.5 py-1.5 rounded-xl font-black text-xs sm:text-sm border-2 transition-all flex items-center gap-2 cursor-pointer focus:outline-none focus:ring-4 focus:ring-amber-400 shrink-0 ${
-              isEnabled
-                ? 'bg-rose-600 hover:bg-rose-700 text-white border-rose-700 shadow-sm'
-                : isHighContrast
-                ? 'bg-amber-400 text-slate-950 hover:bg-amber-300 border-white'
-                : 'bg-[#0A192F] hover:bg-[#1E3A8A] text-white border-[#0A192F]'
-            }`}
-          >
-            {isEnabled ? (
-              <>
-                <MicOff className="w-4 h-4 stroke-[2.5]" />
-                <span>Disable</span>
-              </>
-            ) : (
-              <>
-                <Mic className="w-4 h-4 stroke-[2.5]" />
-                <span>Enable Hands-Free</span>
-              </>
-            )}
-          </button>
-        </div>
-
-        {/* Expandable Conversation & Diagnostics Drawer */}
+        {/* Dropdown Drawer: Verbose 'Status' and 'Live Mic' hidden behind tiny chevron */}
         {isExpanded && (
-          <div className="p-4 sm:p-5 space-y-4 max-h-[320px] overflow-y-auto animate-fadeIn">
-            {/* Active Tab Badge */}
-            <div className="flex items-center gap-2 text-xs font-bold text-slate-500 dark:text-slate-400">
+          <div className="p-3 sm:p-4 border-t border-slate-200 dark:border-slate-800 space-y-3 max-h-[300px] overflow-y-auto animate-fadeIn text-xs">
+            {/* Status & Live Mic Diagnostics Panel */}
+            <div className="space-y-1.5 bg-slate-50 dark:bg-slate-950/60 p-2.5 rounded-xl border border-slate-200 dark:border-slate-800">
+              <div className="flex items-center justify-between gap-2">
+                <div className="flex items-center gap-1.5 truncate font-semibold">
+                  <span className="text-[10px] uppercase font-black tracking-wider text-slate-400">Status:</span>
+                  <span className="font-mono text-[11px] font-bold truncate text-slate-700 dark:text-slate-300">
+                    {connectionStatus}
+                  </span>
+                </div>
+                {isEnabled && (
+                  <span className="flex items-center gap-1 text-[10px] font-mono text-emerald-600 dark:text-emerald-400 shrink-0">
+                    <Activity className="w-3 h-3 animate-pulse" />
+                    <span>Live</span>
+                  </span>
+                )}
+              </div>
+
+              {/* Live Transcript Preview */}
+              <div className="flex items-start gap-1.5 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg px-2.5 py-1.5">
+                <span className="text-[10px] uppercase font-black text-[#D97706] shrink-0 mt-0.5">Live Mic:</span>
+                <p className="font-mono text-[11px] truncate flex-1 text-slate-900 dark:text-slate-100">
+                  {liveTranscript ? (
+                    <span>&quot;{liveTranscript}&quot;</span>
+                  ) : (
+                    <span className="italic text-slate-400">Wake word: &quot;{wakeWord}&quot;</span>
+                  )}
+                </p>
+              </div>
+            </div>
+
+            {/* Active Screen Badge */}
+            <div className="flex items-center gap-1.5 text-[11px] font-bold text-slate-500 dark:text-slate-400">
               <Compass className="w-3.5 h-3.5 text-[#D97706]" />
               <span>
-                Active Screen: <strong className="capitalize text-[#0A192F] dark:text-white">{activeTab}</strong> (Voice navigation supported)
+                Active Screen: <strong className="capitalize text-[#0A192F] dark:text-white">{activeTab}</strong>
               </span>
             </div>
 
-            {/* Live Audio & Speech Monitor */}
-            {isEnabled && (
-              <div
-                className={`p-3 rounded-2xl border-2 text-xs font-bold space-y-1 ${
-                  isHighContrast
-                    ? 'bg-slate-900 border-slate-700 text-slate-200'
-                    : 'bg-[#F8FAFC] border-[#CBD5E1] text-[#334155]'
-                }`}
-              >
-                <div className="flex items-center justify-between text-slate-500 dark:text-slate-400 uppercase text-[10px] font-black">
-                  <span>Live Voice Transcript</span>
-                  <span className="flex items-center gap-1 text-emerald-600 dark:text-emerald-400">
-                    <Radio className="w-3 h-3 animate-pulse" /> Active (Silence paused)
-                  </span>
-                </div>
-                <p className="font-mono text-xs italic min-h-[24px] text-[#0A192F] dark:text-white">
-                  {liveTranscript || '(Listening quietly in the background... say "Hey Lumina")'}
-                </p>
-              </div>
-            )}
-
-            {/* Last Recognized Command */}
+            {/* Recognized Command */}
             {extractedCommand && (
-              <div
-                className={`p-3 rounded-2xl border-2 text-sm space-y-1 ${
-                  isHighContrast
-                    ? 'bg-amber-950/40 border-amber-400 text-white'
-                    : 'bg-amber-50 border-amber-300 text-amber-950'
-                }`}
-              >
-                <div className="text-[11px] font-black uppercase tracking-wider text-[#D97706]">
-                  Processed Spoken Command
+              <div className="p-2.5 rounded-xl border text-xs space-y-0.5 bg-amber-50 dark:bg-amber-950/40 border-amber-300 dark:border-amber-400 text-amber-950 dark:text-amber-100">
+                <div className="text-[10px] font-black uppercase tracking-wider text-[#D97706] flex items-center gap-1">
+                  <CheckCircle2 className="w-3 h-3 text-emerald-600" />
+                  <span>Recognized Command</span>
                 </div>
-                <p className="font-extrabold">&quot;{extractedCommand}&quot;</p>
+                <p className="font-bold">&quot;{extractedCommand}&quot;</p>
               </div>
             )}
 
-            {/* Assistant AI Generated Response */}
+            {/* Assistant Streaming Response */}
             {assistantResponse && (
-              <div
-                className={`p-3 rounded-2xl border-2 text-sm space-y-1 ${
-                  isHighContrast
-                    ? 'bg-slate-900 border-slate-700 text-slate-200'
-                    : 'bg-[#EFF6FF] border-[#BFDBFE] text-[#1E3A8A]'
-                }`}
-              >
-                <div className="flex items-center justify-between text-[11px] font-black uppercase tracking-wider">
-                  <span className="flex items-center gap-1.5">
-                    <Sparkles className="w-3.5 h-3.5" /> Lumina Response
+              <div className="p-2.5 rounded-xl border text-xs space-y-1 bg-[#EFF6FF] dark:bg-slate-900 border-[#BFDBFE] dark:border-slate-700 text-[#1E3A8A] dark:text-slate-200">
+                <div className="flex items-center justify-between text-[10px] font-black uppercase tracking-wider">
+                  <span className="flex items-center gap-1">
+                    <Sparkles className="w-3 h-3" /> Lumina Response
                   </span>
                   {status === 'speaking' && (
                     <span className="text-emerald-600 dark:text-emerald-400 font-bold animate-pulse">
-                      Playing Audio (0.85x rate)
+                      Playing Audio
                     </span>
                   )}
                 </div>
-                <p className="font-medium text-xs sm:text-sm leading-relaxed text-[#0F172A] dark:text-white line-clamp-6">
+                <p className="font-medium text-xs leading-relaxed text-[#0F172A] dark:text-white line-clamp-4">
                   {assistantResponse}
                 </p>
               </div>
             )}
 
-            {/* Privacy & Permission Notice */}
-            <div className="text-[11px] font-bold text-slate-500 dark:text-slate-400 flex items-start gap-2 pt-1">
-              <ShieldCheck className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
-              <span>
-                <strong>Zero Audio Leakage:</strong> Speech is parsed on your local device. Non-wake audio is immediately discarded.
-              </span>
+            {/* Privacy Assurance */}
+            <div className="text-[10px] font-semibold text-slate-400 dark:text-slate-500 flex items-center gap-1.5">
+              <ShieldCheck className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
+              <span>Local voice processing • Non-wake audio discarded</span>
             </div>
           </div>
         )}
 
         {/* Error Alert Display */}
         {errorMessage && (
-          <div className="p-3 bg-rose-50 dark:bg-rose-950/80 border-t-2 border-rose-400 text-rose-900 dark:text-rose-200 text-xs font-black flex items-center justify-between gap-2">
-            <div className="flex items-center gap-2">
-              <AlertCircle className="w-4 h-4 text-rose-600 shrink-0" />
-              <span>{errorMessage}</span>
+          <div className="px-3 py-1.5 bg-rose-50 dark:bg-rose-950/80 border-t border-rose-300 text-rose-900 dark:text-rose-200 text-xs font-bold flex items-center justify-between gap-2">
+            <div className="flex items-center gap-1.5 truncate">
+              <AlertCircle className="w-3.5 h-3.5 text-rose-600 shrink-0" />
+              <span className="truncate">{errorMessage}</span>
             </div>
             <button
               type="button"
               onClick={() => setErrorMessage(null)}
-              className="text-rose-700 dark:text-rose-300 hover:text-rose-900"
+              className="text-rose-700 dark:text-rose-300 hover:text-rose-900 cursor-pointer"
               aria-label="Dismiss error"
             >
-              <X className="w-4 h-4" />
+              <X className="w-3.5 h-3.5" />
             </button>
           </div>
         )}
       </div>
     </aside>
+  );
+}
+
+/**
+ * Strict Error Boundary State and Props
+ */
+interface ErrorBoundaryProps {
+  children: ReactNode;
+}
+
+interface ErrorBoundaryState {
+  hasError: boolean;
+  error: Error | null;
+}
+
+/**
+ * Strict Error Boundary wrapping VoiceAssistant to guarantee failure isolation
+ */
+export class VoiceAssistantErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundaryState> {
+  constructor(props: ErrorBoundaryProps) {
+    super(props);
+    this.state = { hasError: false, error: null };
+  }
+
+  static getDerivedStateFromError(error: Error): ErrorBoundaryState {
+    return { hasError: true, error };
+  }
+
+  componentDidCatch(error: Error, errorInfo: ErrorInfo) {
+    console.error('VoiceAssistant Error Boundary caught an issue:', error, errorInfo);
+  }
+
+  handleReset = () => {
+    this.setState({ hasError: false, error: null });
+  };
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <aside
+          id="voice-assistant-error-fallback"
+          className="fixed top-3 right-3 sm:right-6 z-40 max-w-[calc(100vw-1.5rem)] sm:max-w-md"
+        >
+          <div className="rounded-2xl border-2 border-rose-400 bg-white dark:bg-slate-900 p-4 shadow-xl text-xs space-y-2.5">
+            <div className="flex items-center gap-2 text-rose-600 font-bold">
+              <AlertCircle className="w-4 h-4 shrink-0" />
+              <span>Voice Assistant Recovered from Unexpected Error</span>
+            </div>
+            <p className="text-slate-600 dark:text-slate-300">
+              The speech engine encountered an exception. Click below to re-initialize cleanly.
+            </p>
+            <button
+              type="button"
+              onClick={this.handleReset}
+              className="px-3 py-1.5 rounded-lg bg-rose-600 text-white font-bold flex items-center gap-1.5 cursor-pointer hover:bg-rose-700 transition-colors"
+            >
+              <RotateCcw className="w-3.5 h-3.5" />
+              <span>Restart Assistant</span>
+            </button>
+          </div>
+        </aside>
+      );
+    }
+
+    return this.props.children;
+  }
+}
+
+/**
+ * Primary Export: VoiceAssistant wrapped safely in VoiceAssistantErrorBoundary
+ */
+export function VoiceAssistant(props: VoiceAssistantProps) {
+  return (
+    <VoiceAssistantErrorBoundary>
+      <VoiceAssistantInner {...props} />
+    </VoiceAssistantErrorBoundary>
   );
 }
